@@ -1,0 +1,6 @@
+uhd
+numpy
+scipy
+pyqtgraph
+PySide6
+scikit-learn
