@@ -13,10 +13,20 @@ import logging
 try:
     import sk_dsp_comm.digitalcom as dc
     import sk_dsp_comm.synchronization as sync
-    import sk_dsp_comm.fsk as fsk
+    import sk_dsp_comm.fec_conv as fec
+    import sk_dsp_comm.sigsys as ss
+    import sk_dsp_comm.fir_design_helper as fir
+    import sk_dsp_comm.multirate_helper as mr
     SCIKIT_DSP_AVAILABLE = True
 except ImportError:
     SCIKIT_DSP_AVAILABLE = False
+
+# Try to import sdr library components
+try:
+    import sdr
+    SDR_AVAILABLE = True
+except ImportError:
+    SDR_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +216,113 @@ class PSKDemodulator(BaseDemodulator):
     """Binary Phase Shift Keying demodulator."""
     
     def demodulate(self, signal_data: np.ndarray) -> Dict[str, Any]:
-        """Demodulate BPSK signal."""
+        """Demodulate BPSK signal using advanced libraries."""
+        try:
+            if SDR_AVAILABLE:
+                return self._demodulate_with_sdr(signal_data)
+            elif SCIKIT_DSP_AVAILABLE:
+                return self._demodulate_with_scikit(signal_data)
+            else:
+                return self._demodulate_basic(signal_data)
+                
+        except Exception as e:
+            logger.error(f"PSK demodulation error: {e}")
+            return {"demodulated_data": np.array([]), "error": str(e)}
+    
+    def _demodulate_with_sdr(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Demodulate BPSK using sdr library."""
+        try:
+            # Normalize signal
+            signal_norm = self._normalize_signal(signal_data)
+            
+            # Create PSK modulator for reference constellation
+            M = 2  # BPSK
+            constellation = sdr.PSK(M)
+            
+            # Symbol timing recovery
+            samples_per_symbol = int(self.sample_rate / self.symbol_rate)
+            
+            # Pulse shaping (Root Raised Cosine)
+            h_rrc = sdr.root_raised_cosine(0.35, samples_per_symbol, 10)
+            
+            # Matched filtering
+            matched_filtered = np.convolve(signal_norm, np.conj(h_rrc[::-1]), mode='same')
+            
+            # Timing recovery using Mueller & Muller
+            recovered_symbols = self._timing_recovery_mm(matched_filtered, samples_per_symbol)
+            
+            # Phase recovery using Costas loop
+            phase_recovered = self._costas_loop(recovered_symbols, M)
+            
+            # Symbol decision
+            symbols = constellation.decide(phase_recovered)
+            bits = constellation.demodulate(symbols)
+            
+            # Calculate metrics
+            evm = self._calculate_evm_advanced(phase_recovered, symbols)
+            ber = self._estimate_ber_advanced(phase_recovered, symbols)
+            
+            return {
+                "demodulated_data": bits,
+                "symbols": symbols,
+                "constellation_points": phase_recovered,
+                "sample_rate": self.symbol_rate,
+                "data_type": "digital",
+                "evm": evm,
+                "ber_estimate": ber,
+                "snr_db": -20 * np.log10(evm) if evm > 0 else float('inf')
+            }
+            
+        except Exception as e:
+            logger.warning(f"SDR library demodulation failed: {e}")
+            return self._demodulate_basic(signal_data)
+    
+    def _demodulate_with_scikit(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Demodulate BPSK using scikit-dsp-comm."""
+        try:
+            # Normalize signal
+            signal_norm = self._normalize_signal(signal_data)
+            
+            # Symbol timing recovery
+            samples_per_symbol = int(self.sample_rate / self.symbol_rate)
+            
+            # Create matched filter using FIR design helper
+            h_matched = fir.firwin_kaiser_lpf(samples_per_symbol, 1/(2*samples_per_symbol), 60)
+            
+            # Apply matched filter
+            filtered = signal.lfilter(h_matched, 1, signal_norm)
+            
+            # Timing recovery using scikit-dsp-comm
+            recovered_signal, timing_error = sync.NDA_symb_sync(filtered, samples_per_symbol, 0.01, 2.0)
+            
+            # Phase recovery for BPSK
+            phase_recovered = sync.DD_carrier_sync(recovered_signal, 2, 0.01, 2.0)
+            
+            # Symbol decision
+            symbols = np.sign(np.real(phase_recovered))
+            bits = (symbols > 0).astype(int)
+            
+            # Calculate EVM and BER
+            evm = np.sqrt(np.mean(np.abs(phase_recovered - symbols)**2))
+            ber = np.mean(bits != (np.real(phase_recovered) > 0))
+            
+            return {
+                "demodulated_data": bits,
+                "symbols": symbols,
+                "constellation_points": phase_recovered,
+                "sample_rate": self.symbol_rate,
+                "data_type": "digital",
+                "evm": evm,
+                "ber_estimate": ber,
+                "timing_error": timing_error
+            }
+            
+        except Exception as e:
+            logger.warning(f"Scikit-DSP-Comm demodulation failed: {e}")
+            return self._demodulate_basic(signal_data)
+    
+    def _demodulate_basic(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Basic BPSK demodulation fallback."""
         try:
             # Normalize signal
             signal_norm = self._normalize_signal(signal_data)
@@ -239,10 +355,98 @@ class PSKDemodulator(BaseDemodulator):
             }
             
         except Exception as e:
-            logger.error(f"PSK demodulation error: {e}")
+            logger.error(f"Basic PSK demodulation error: {e}")
             return {"demodulated_data": np.array([]), "error": str(e)}
     
-    def _calculate_evm(self, received_symbols: np.ndarray, decided_bits: np.ndarray) -> float:
+    def _timing_recovery_mm(self, signal_data: np.ndarray, sps: int) -> np.ndarray:
+        """Mueller & Muller timing recovery."""
+        try:
+            # Simplified M&M algorithm
+            mu = 0.0  # Timing offset
+            out = []
+            out_rail = []
+            
+            for i in range(len(signal_data)):
+                if i % sps == 0:
+                    out.append(signal_data[i])
+                    # Simplified timing error detector
+                    if len(out) > 1:
+                        timing_error = np.real(out[-1] * np.conj(out[-2]))
+                        mu += 0.01 * timing_error  # Update timing
+            
+            return np.array(out)
+            
+        except Exception:
+            # Fallback to simple downsampling
+            return signal_data[::sps]
+    
+    def _costas_loop(self, signal_data: np.ndarray, M: int) -> np.ndarray:
+        """Costas loop for phase recovery."""
+        try:
+            phase = 0.0
+            alpha = 0.01  # Loop gain
+            output = np.zeros_like(signal_data)
+            
+            for i, sample in enumerate(signal_data):
+                # Apply phase correction
+                corrected = sample * np.exp(-1j * phase)
+                output[i] = corrected
+                
+                # Phase error detector for BPSK (M=2)
+                if M == 2:
+                    error = np.imag(corrected) * np.sign(np.real(corrected))
+                else:
+                    error = np.imag(corrected * np.conj(corrected)**(M-1))
+                
+                # Update phase
+                phase += alpha * error
+                
+            return output
+            
+        except Exception:
+            return signal_data
+            
+        except Exception as e:
+            logger.error(f"PSK demodulation error: {e}")
+            return {"demodulated_data": np.array([]), "error": str(e)}
+    def _calculate_evm_advanced(self, received_symbols: np.ndarray, ideal_symbols: np.ndarray) -> float:
+        """Calculate advanced Error Vector Magnitude."""
+        try:
+            if len(received_symbols) != len(ideal_symbols):
+                return 0.0
+            
+            error_vector = received_symbols - ideal_symbols
+            signal_power = np.mean(np.abs(ideal_symbols)**2)
+            error_power = np.mean(np.abs(error_vector)**2)
+            
+            if signal_power > 0:
+                evm = np.sqrt(error_power / signal_power)
+                return float(evm)
+                
+        except Exception as e:
+            logger.warning(f"Advanced EVM calculation error: {e}")
+        
+        return 0.0
+    
+    def _estimate_ber_advanced(self, received_symbols: np.ndarray, ideal_symbols: np.ndarray) -> float:
+        """Estimate advanced Bit Error Rate."""
+        try:
+            if len(received_symbols) != len(ideal_symbols):
+                return 0.0
+            
+            # Convert symbols to bits for comparison
+            received_bits = (np.real(received_symbols) > 0).astype(int)
+            ideal_bits = (np.real(ideal_symbols) > 0).astype(int)
+            
+            errors = np.sum(received_bits != ideal_bits)
+            total_bits = len(received_bits)
+            
+            return errors / total_bits if total_bits > 0 else 0.0
+            
+        except Exception as e:
+            logger.warning(f"Advanced BER estimation error: {e}")
+        
+        return 0.0
         """Calculate Error Vector Magnitude."""
         try:
             # Ideal BPSK constellation
@@ -285,8 +489,171 @@ class PSKDemodulator(BaseDemodulator):
 class QPSKDemodulator(BaseDemodulator):
     """Quadrature Phase Shift Keying demodulator."""
     
+    def _timing_recovery_mm(self, signal_data: np.ndarray, sps: int) -> np.ndarray:
+        """Mueller & Muller timing recovery."""
+        try:
+            # Simplified M&M algorithm
+            mu = 0.0  # Timing offset
+            out = []
+            
+            for i in range(len(signal_data)):
+                if i % sps == 0:
+                    out.append(signal_data[i])
+                    # Simplified timing error detector
+                    if len(out) > 1:
+                        timing_error = np.real(out[-1] * np.conj(out[-2]))
+                        mu += 0.01 * timing_error  # Update timing
+            
+            return np.array(out) if out else np.array([])
+            
+        except Exception:
+            # Fallback to simple downsampling
+            return signal_data[::sps] if len(signal_data) >= sps else signal_data
+    
+    def _costas_loop(self, signal_data: np.ndarray, M: int) -> np.ndarray:
+        """Costas loop for phase recovery."""
+        try:
+            phase = 0.0
+            alpha = 0.01  # Loop gain
+            output = np.zeros_like(signal_data)
+            
+            for i, sample in enumerate(signal_data):
+                # Apply phase correction
+                corrected = sample * np.exp(-1j * phase)
+                output[i] = corrected
+                
+                # Phase error detector for QPSK (M=4)
+                if M == 4:
+                    error = np.imag(corrected**3) * np.real(corrected)
+                else:
+                    error = np.imag(corrected * np.conj(corrected)**(M-1))
+                
+                # Update phase
+                phase += alpha * error
+            
+            return output
+            
+        except Exception:
+            return signal_data
+    
     def demodulate(self, signal_data: np.ndarray) -> Dict[str, Any]:
-        """Demodulate QPSK signal."""
+        """Demodulate QPSK signal using advanced libraries."""
+        try:
+            if SDR_AVAILABLE:
+                return self._demodulate_qpsk_with_sdr(signal_data)
+            elif SCIKIT_DSP_AVAILABLE:
+                return self._demodulate_qpsk_with_scikit(signal_data)
+            else:
+                return self._demodulate_qpsk_basic(signal_data)
+                
+        except Exception as e:
+            logger.error(f"QPSK demodulation error: {e}")
+            return {"demodulated_data": np.array([]), "error": str(e)}
+    
+    def update_parameters(self, parameters: Dict[str, Any]):
+        """Update demodulator parameters."""
+        if 'symbol_rate' in parameters:
+            # Use estimated symbol rate but with reasonable bounds
+            estimated_rate = parameters['symbol_rate']
+            # Clamp to reasonable range (1kHz to 1MHz)
+            self.symbol_rate = max(1000, min(1e6, estimated_rate))
+            logger.debug(f"Updated QPSK symbol rate to {self.symbol_rate} Hz")
+    
+    def _demodulate_qpsk_with_sdr(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Demodulate QPSK using sdr library."""
+        try:
+            # Normalize signal
+            signal_norm = self._normalize_signal(signal_data)
+            
+            # Create QPSK modulator for reference
+            M = 4  # QPSK
+            constellation = sdr.PSK(M)
+            
+            # Symbol timing recovery
+            samples_per_symbol = int(self.sample_rate / self.symbol_rate)
+            
+            # Root Raised Cosine filter
+            h_rrc = sdr.root_raised_cosine(0.35, samples_per_symbol, 10)
+            
+            # Matched filtering
+            matched_filtered = np.convolve(signal_norm, np.conj(h_rrc[::-1]), mode='same')
+            
+            # Timing recovery
+            recovered_symbols = self._timing_recovery_mm(matched_filtered, samples_per_symbol)
+            
+            # Phase recovery using Costas loop for QPSK
+            phase_recovered = self._costas_loop(recovered_symbols, M)
+            
+            # Symbol decision
+            try:
+                # Try sdr library method
+                if hasattr(constellation, 'decide'):
+                    decided_symbols = constellation.decide(phase_recovered)
+                    bits = constellation.demodulate(decided_symbols)
+                elif hasattr(constellation, 'demodulate'):
+                    bits = constellation.demodulate(phase_recovered)
+                    decided_symbols = self._qpsk_decision(phase_recovered)
+                else:
+                    # Manual QPSK decision
+                    decided_symbols = self._qpsk_decision(phase_recovered)
+                    bits = self._qpsk_to_bits(decided_symbols)
+            except Exception:
+                # Fallback to manual decision
+                decided_symbols = self._qpsk_decision(phase_recovered)
+                bits = self._qpsk_to_bits(decided_symbols)
+            
+            # Ensure numpy arrays - handle complex data properly
+            if not isinstance(bits, np.ndarray):
+                if hasattr(bits, '__iter__') and any(isinstance(x, complex) for x in bits):
+                    # Handle complex list/array - convert to real first
+                    real_bits = np.real(np.array(bits)).astype(int)
+                    bits = real_bits
+                else:
+                    bits = np.array(bits, dtype=int)
+            elif bits.dtype == complex:
+                # Convert complex to real by taking real part
+                bits = np.real(bits).astype(int)
+            
+            # Ensure bits is 1D array
+            if bits.ndim > 1:
+                bits = bits.flatten()
+            
+            decided_symbols = np.array(decided_symbols) if not isinstance(decided_symbols, np.ndarray) else decided_symbols
+            phase_recovered = np.array(phase_recovered) if not isinstance(phase_recovered, np.ndarray) else phase_recovered
+            
+            # Ensure symbols are 1D
+            if decided_symbols.ndim > 1:
+                decided_symbols = decided_symbols.flatten()
+            if phase_recovered.ndim > 1:
+                phase_recovered = phase_recovered.flatten()
+            
+            # Ensure bits is numpy array
+            if not isinstance(bits, np.ndarray):
+                bits = np.array(bits) if bits is not None else np.array([])
+            if not isinstance(decided_symbols, np.ndarray):
+                decided_symbols = np.array(decided_symbols) if decided_symbols is not None else np.array([])
+            
+            # Calculate metrics
+            evm = self._calculate_evm_advanced(phase_recovered, decided_symbols)
+            ber = self._estimate_ber_qpsk(phase_recovered, decided_symbols)
+            
+            return {
+                "demodulated_data": bits,
+                "symbols": decided_symbols,
+                "constellation_points": phase_recovered,
+                "sample_rate": self.symbol_rate * 2,  # 2 bits per symbol
+                "data_type": "digital",
+                "evm": evm,
+                "ber_estimate": ber,
+                "snr_db": -20 * np.log10(evm) if evm > 0 else float('inf')
+            }
+            
+        except Exception as e:
+            logger.warning(f"SDR QPSK demodulation failed: {e}")
+            return self._demodulate_qpsk_basic(signal_data)
+    
+    def _demodulate_qpsk_with_scikit(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Demodulate QPSK using scikit-dsp-comm."""
         try:
             # Normalize signal
             signal_norm = self._normalize_signal(signal_data)
@@ -294,35 +661,164 @@ class QPSKDemodulator(BaseDemodulator):
             # Symbol timing recovery
             samples_per_symbol = int(self.sample_rate / self.symbol_rate)
             
-            # Matched filter
-            matched_filter = np.ones(samples_per_symbol) / samples_per_symbol
-            filtered = np.convolve(signal_norm, matched_filter, mode='same')
+            # Create matched filter
+            h_matched = fir.firwin_kaiser_lpf(samples_per_symbol, 1/(2*samples_per_symbol), 60)
             
-            # Sample at symbol rate
-            symbol_indices = np.arange(samples_per_symbol//2, len(filtered), samples_per_symbol)
-            symbols = filtered[symbol_indices]
+            # Apply matched filter
+            filtered = signal.lfilter(h_matched, 1, signal_norm)
             
-            # QPSK decision
-            bits = []
-            for symbol in symbols:
-                # Determine quadrant
-                real_bit = 1 if np.real(symbol) > 0 else 0
-                imag_bit = 1 if np.imag(symbol) > 0 else 0
-                bits.extend([real_bit, imag_bit])
+            # Timing recovery
+            recovered_signal, timing_error = sync.NDA_symb_sync(filtered, samples_per_symbol, 0.01, 2.0)
+            
+            # Carrier recovery for QPSK
+            phase_recovered = sync.DD_carrier_sync(recovered_signal, 4, 0.01, 2.0)
+            
+            # QPSK symbol decision
+            decided_symbols = self._qpsk_decision(phase_recovered)
+            bits = self._qpsk_to_bits(decided_symbols)
+            
+            # Calculate metrics
+            evm = np.sqrt(np.mean(np.abs(phase_recovered - decided_symbols)**2))
+            ber = self._estimate_ber_qpsk(phase_recovered, decided_symbols)
             
             return {
-                "demodulated_data": np.array(bits),
-                "symbols": symbols,
-                "sample_rate": self.symbol_rate * 2,  # 2 bits per symbol
+                "demodulated_data": bits,
+                "symbols": decided_symbols,
+                "constellation_points": phase_recovered,
+                "sample_rate": self.symbol_rate * 2,
                 "data_type": "digital",
-                "constellation": symbols,
-                "evm": self._calculate_qpsk_evm(symbols),
-                "ber_estimate": self._estimate_ber(symbols)
+                "evm": evm,
+                "ber_estimate": ber,
+                "timing_error": timing_error
             }
             
         except Exception as e:
-            logger.error(f"QPSK demodulation error: {e}")
-            return {"demodulated_data": np.array([]), "error": str(e)}
+            logger.warning(f"Scikit QPSK demodulation failed: {e}")
+            return self._demodulate_qpsk_basic(signal_data)
+    
+    def _demodulate_qpsk_basic(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Basic QPSK demodulation fallback."""
+        try:
+            # Normalize signal
+            signal_norm = self._normalize_signal(signal_data)
+            
+            # Calculate symbol timing parameters
+            samples_per_symbol = max(1, int(self.sample_rate / self.symbol_rate))
+            
+            # Matched filter (simple rectangular)
+            if samples_per_symbol > 1:
+                matched_filter = np.ones(samples_per_symbol) / np.sqrt(samples_per_symbol)
+                filtered = np.convolve(signal_norm, matched_filter, mode='same')
+            else:
+                filtered = signal_norm
+            
+            # Sample at symbol rate with better timing
+            # Start from a good offset to avoid transients
+            start_offset = samples_per_symbol // 2
+            symbol_indices = np.arange(start_offset, len(filtered), samples_per_symbol)
+            
+            # Ensure we don't go out of bounds
+            symbol_indices = symbol_indices[symbol_indices < len(filtered)]
+            symbols = filtered[symbol_indices]
+            
+            # Only proceed if we have enough symbols
+            if len(symbols) < 2:
+                self.logger.warning(f"Too few symbols recovered: {len(symbols)}")
+                return {"demodulated_data": np.array([]), "data_type": "digital", "error": "Too few symbols"}
+            
+            # QPSK decision and bit extraction
+            bits = []
+            decided_symbols = []
+            
+            for symbol in symbols:
+                # Make QPSK decision
+                real_part = 1 if np.real(symbol) > 0 else -1
+                imag_part = 1 if np.imag(symbol) > 0 else -1
+                decided_symbol = (real_part + 1j * imag_part) / np.sqrt(2)
+                decided_symbols.append(decided_symbol)
+                
+                # Convert to bits (Gray coding)
+                if np.real(symbol) > 0 and np.imag(symbol) > 0:  # 00
+                    bits.extend([0, 0])
+                elif np.real(symbol) < 0 and np.imag(symbol) > 0:  # 01
+                    bits.extend([0, 1])
+                elif np.real(symbol) < 0 and np.imag(symbol) < 0:  # 11
+                    bits.extend([1, 1])
+                else:  # 10 - real > 0, imag < 0
+                    bits.extend([1, 0])
+            
+            # Convert to numpy arrays
+            bits_array = np.array(bits, dtype=np.uint8)
+            symbols_array = np.array(symbols)
+            decided_symbols_array = np.array(decided_symbols)
+
+            # Calculate performance metrics
+            evm = self._calculate_qpsk_evm(decided_symbols_array)
+            ber = self._estimate_ber_qpsk(symbols_array, decided_symbols_array)
+
+            self.logger.debug(f"QPSK Basic demod: {len(symbols)} symbols -> {len(bits)} bits")
+
+            return {
+                "demodulated_data": bits_array,
+                "symbols": decided_symbols_array,
+                "constellation_points": symbols_array,
+                "sample_rate": self.symbol_rate * 2,  # 2 bits per symbol
+                "data_type": "digital",
+                "evm": evm,
+                "ber_estimate": ber,
+                "snr_db": -20 * np.log10(evm/100) if evm > 0 else float('inf'),
+                "timing_offset": start_offset
+            }
+            
+        except Exception as e:
+            logger.error(f"Basic QPSK demodulation error: {e}")
+            return {"demodulated_data": np.array([]), "data_type": "digital", "error": str(e)}
+    
+    def _qpsk_decision(self, symbols: np.ndarray) -> np.ndarray:
+        """Make QPSK symbol decisions."""
+        # QPSK constellation points: [1+1j, -1+1j, -1-1j, 1-1j] / sqrt(2)
+        decided = np.zeros_like(symbols)
+        
+        for i, symbol in enumerate(symbols):
+            real_part = 1 if np.real(symbol) > 0 else -1
+            imag_part = 1 if np.imag(symbol) > 0 else -1
+            decided[i] = (real_part + 1j * imag_part) / np.sqrt(2)
+        
+        return decided
+    
+    def _qpsk_to_bits(self, symbols: np.ndarray) -> np.ndarray:
+        """Convert QPSK symbols to bits."""
+        bits = []
+        for symbol in symbols:
+            # Gray coding for QPSK
+            if np.real(symbol) > 0 and np.imag(symbol) > 0:  # 00
+                bits.extend([0, 0])
+            elif np.real(symbol) < 0 and np.imag(symbol) > 0:  # 01
+                bits.extend([0, 1])
+            elif np.real(symbol) < 0 and np.imag(symbol) < 0:  # 11
+                bits.extend([1, 1])
+            else:  # 10
+                bits.extend([1, 0])
+        
+        return np.array(bits)
+    
+    def _estimate_ber_qpsk(self, received_symbols: np.ndarray, ideal_symbols: np.ndarray) -> float:
+        """Estimate BER for QPSK."""
+        try:
+            if len(received_symbols) != len(ideal_symbols):
+                return 0.0
+            
+            received_bits = self._qpsk_to_bits(self._qpsk_decision(received_symbols))
+            ideal_bits = self._qpsk_to_bits(ideal_symbols)
+            
+            errors = np.sum(received_bits != ideal_bits)
+            total_bits = len(received_bits)
+            
+            return errors / total_bits if total_bits > 0 else 0.0
+            
+        except Exception as e:
+            logger.warning(f"QPSK BER estimation error: {e}")
+            return 0.0
     
     def _calculate_qpsk_evm(self, symbols: np.ndarray) -> float:
         """Calculate EVM for QPSK."""
@@ -340,15 +836,55 @@ class QPSKDemodulator(BaseDemodulator):
                 error = symbol - closest_ideal
                 evm_sum += np.abs(error) ** 2
             
-            # Average EVM
+                # Average EVM
             if len(symbols) > 0:
                 avg_evm = np.sqrt(evm_sum / len(symbols)) * 100
                 return float(avg_evm)
+            return 0.0
                 
         except Exception as e:
             logger.warning(f"QPSK EVM calculation error: {e}")
-        
-        return 0.0
+            return 0.0
+    
+    def _calculate_evm_advanced(self, received_symbols: np.ndarray, ideal_symbols: np.ndarray) -> float:
+        """Calculate advanced EVM."""
+        try:
+            if len(received_symbols) == 0 or len(ideal_symbols) == 0:
+                return 0.0
+            
+            min_len = min(len(received_symbols), len(ideal_symbols))
+            received = received_symbols[:min_len]
+            ideal = ideal_symbols[:min_len]
+            
+            error_vector = received - ideal
+            signal_power = np.mean(np.abs(ideal) ** 2)
+            error_power = np.mean(np.abs(error_vector) ** 2)
+            
+            evm = np.sqrt(error_power / signal_power) * 100 if signal_power > 0 else 0.0
+            return float(evm)
+            
+        except Exception as e:
+            logger.warning(f"Advanced EVM calculation error: {e}")
+            return 0.0
+    
+    def _estimate_ber(self, symbols: np.ndarray) -> float:
+        """Estimate basic BER."""
+        try:
+            if len(symbols) == 0:
+                return 0.0
+            
+            # Simple BER estimation based on EVM
+            evm = self._calculate_qpsk_evm(symbols) / 100.0  # Convert to ratio
+            
+            # Rough BER approximation for QPSK
+            if evm > 0:
+                ber = 0.5 * np.exp(-1 / (2 * evm**2))
+                return float(ber)
+            return 0.0
+            
+        except Exception as e:
+            logger.warning(f"QPSK EVM calculation error: {e}")
+            return 0.0
     
     def _estimate_ber(self, symbols: np.ndarray) -> float:
         """Estimate BER for QPSK."""
@@ -635,7 +1171,107 @@ class FSKDemodulator(BaseDemodulator):
             self.space_frequency = parameters["frequency_deviation"]
     
     def demodulate(self, signal_data: np.ndarray) -> Dict[str, Any]:
-        """Demodulate FSK signal."""
+        """Demodulate FSK signal using advanced libraries."""
+        try:
+            if SCIKIT_DSP_AVAILABLE:
+                return self._demodulate_fsk_with_scikit(signal_data)
+            elif SDR_AVAILABLE:
+                return self._demodulate_fsk_with_sdr(signal_data)
+            else:
+                return self._demodulate_fsk_basic(signal_data)
+                
+        except Exception as e:
+            logger.error(f"FSK demodulation error: {e}")
+            return {"demodulated_data": np.array([]), "error": str(e)}
+    
+    def _demodulate_fsk_with_scikit(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Demodulate FSK using scikit-dsp-comm."""
+        try:
+            # Use scikit-dsp-comm's FSK demodulation capabilities
+            samples_per_symbol = int(self.sample_rate / self.symbol_rate)
+            
+            # Create bandpass filters for mark and space frequencies
+            mark_filter = fir.firwin_kaiser_bpf(
+                101, 
+                (self.mark_frequency - self.symbol_rate/2) / (self.sample_rate/2),
+                (self.mark_frequency + self.symbol_rate/2) / (self.sample_rate/2),
+                60
+            )
+            
+            space_filter = fir.firwin_kaiser_bpf(
+                101,
+                (self.space_frequency - self.symbol_rate/2) / (self.sample_rate/2),
+                (self.space_frequency + self.symbol_rate/2) / (self.sample_rate/2),
+                60
+            )
+            
+            # Filter signals
+            mark_filtered = signal.lfilter(mark_filter, 1, signal_data)
+            space_filtered = signal.lfilter(space_filter, 1, signal_data)
+            
+            # Energy detection
+            mark_energy = np.abs(mark_filtered)**2
+            space_energy = np.abs(space_filtered)**2
+            
+            # Integrate over symbol periods
+            mark_integrated = self._integrate_and_dump(mark_energy, samples_per_symbol)
+            space_integrated = self._integrate_and_dump(space_energy, samples_per_symbol)
+            
+            # Make decisions
+            bits = (mark_integrated > space_integrated).astype(int)
+            
+            # Calculate SNR
+            signal_power = np.mean(np.maximum(mark_integrated, space_integrated))
+            noise_power = np.mean(np.minimum(mark_integrated, space_integrated))
+            snr_db = 10 * np.log10(signal_power / noise_power) if noise_power > 0 else float('inf')
+            
+            return {
+                "demodulated_data": bits,
+                "sample_rate": self.symbol_rate,
+                "data_type": "digital",
+                "mark_energy": mark_integrated,
+                "space_energy": space_integrated,
+                "snr_db": snr_db,
+                "frequency_separation": self.frequency_separation
+            }
+            
+        except Exception as e:
+            logger.warning(f"Scikit FSK demodulation failed: {e}")
+            return self._demodulate_fsk_basic(signal_data)
+    
+    def _demodulate_fsk_with_sdr(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Demodulate FSK using sdr library."""
+        try:
+            # Use frequency discrimination method
+            # Instantaneous frequency
+            analytic_signal = signal.hilbert(np.real(signal_data))
+            instantaneous_phase = np.unwrap(np.angle(analytic_signal))
+            instantaneous_freq = np.diff(instantaneous_phase) * self.sample_rate / (2 * np.pi)
+            
+            # Symbol timing recovery
+            samples_per_symbol = int(self.sample_rate / self.symbol_rate)
+            
+            # Integrate and dump
+            freq_integrated = self._integrate_and_dump(instantaneous_freq, samples_per_symbol)
+            
+            # Decision based on frequency threshold
+            freq_threshold = (self.mark_frequency + self.space_frequency) / 2
+            bits = (freq_integrated > freq_threshold).astype(int)
+            
+            return {
+                "demodulated_data": bits,
+                "sample_rate": self.symbol_rate,
+                "data_type": "digital",
+                "instantaneous_freq": instantaneous_freq,
+                "frequency_threshold": freq_threshold
+            }
+            
+        except Exception as e:
+            logger.warning(f"SDR FSK demodulation failed: {e}")
+            return self._demodulate_fsk_basic(signal_data)
+    
+    def _demodulate_fsk_basic(self, signal_data: np.ndarray) -> Dict[str, Any]:
+        """Basic FSK demodulation fallback."""
         try:
             # Non-coherent FSK demodulation using energy detection
             samples_per_symbol = int(self.sample_rate / self.symbol_rate)
@@ -653,6 +1289,49 @@ class FSKDemodulator(BaseDemodulator):
             cutoff = self.symbol_rate / 2
             nyquist = self.sample_rate / 2
             sos = signal.butter(6, cutoff / nyquist, output='sos')
+            
+            mark_filtered = signal.sosfilt(sos, mark_mixed)
+            space_filtered = signal.sosfilt(sos, space_mixed)
+            
+            # Energy detection
+            mark_energy = np.abs(mark_filtered)**2
+            space_energy = np.abs(space_filtered)**2
+            
+            # Integrate and dump
+            mark_integrated = self._integrate_and_dump(mark_energy, samples_per_symbol)
+            space_integrated = self._integrate_and_dump(space_energy, samples_per_symbol)
+            
+            # Decision
+            bits = (mark_integrated > space_integrated).astype(int)
+            
+            return {
+                "demodulated_data": bits,
+                "sample_rate": self.symbol_rate,
+                "data_type": "digital",
+                "mark_energy": mark_integrated,
+                "space_energy": space_integrated
+            }
+            
+        except Exception as e:
+            logger.error(f"Basic FSK demodulation error: {e}")
+            return {"demodulated_data": np.array([]), "error": str(e)}
+    
+    def _integrate_and_dump(self, data: np.ndarray, samples_per_symbol: int) -> np.ndarray:
+        """Integrate and dump filter."""
+        try:
+            num_symbols = len(data) // samples_per_symbol
+            integrated = np.zeros(num_symbols)
+            
+            for i in range(num_symbols):
+                start_idx = i * samples_per_symbol
+                end_idx = start_idx + samples_per_symbol
+                integrated[i] = np.sum(data[start_idx:end_idx])
+            
+            return integrated
+            
+        except Exception as e:
+            logger.warning(f"Integrate and dump error: {e}")
+            return np.array([])
             
             mark_filtered = signal.sosfilt(sos, mark_mixed)
             space_filtered = signal.sosfilt(sos, space_mixed)

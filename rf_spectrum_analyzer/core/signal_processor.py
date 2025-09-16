@@ -688,13 +688,28 @@ class SignalProcessor:
             
             # Step 3: Encoding analysis (if we have digital data)
             demod_data = demod_result.get("demodulated_data", np.array([]))
+            
+            # Debug logging
+            self.logger.debug(f"Demod data type: {type(demod_data)}, value: {demod_data}")
+            
+            # Ensure demod_data is numpy array
+            if not isinstance(demod_data, np.ndarray):
+                if isinstance(demod_data, (list, tuple)):
+                    demod_data = np.array(demod_data)
+                else:
+                    demod_data = np.array([])
+            
             if demod_result.get("data_type") == "digital" and len(demod_data) > 0:
                 
-                # Convert to binary if needed
-                if demod_data.dtype != bool and demod_data.dtype != int:
-                    binary_data = (demod_data > np.mean(demod_data)).astype(int)
-                else:
-                    binary_data = demod_data.astype(int)
+                # Convert to binary if needed - with extra safety
+                try:
+                    if hasattr(demod_data, 'dtype') and demod_data.dtype != bool and demod_data.dtype != int:
+                        binary_data = (demod_data > np.mean(demod_data)).astype(int)
+                    else:
+                        binary_data = demod_data.astype(int)
+                except AttributeError as e:
+                    self.logger.error(f"Dtype access error on {type(demod_data)}: {e}")
+                    binary_data = np.array(demod_data, dtype=int)
                 
                 enc_analysis = self.analyze_encoding(binary_data)
                 result["encoding_analysis"] = enc_analysis
@@ -729,6 +744,101 @@ class SignalProcessor:
                 "final_data": np.array([])
             }
     
+    def process_complete_chain(self, iq_samples: np.ndarray) -> Dict[str, Any]:
+        """
+        Process complete signal chain: modulation analysis -> demodulation -> decoding.
+        
+        Args:
+            iq_samples: Complex IQ samples
+            
+        Returns:
+            Dictionary with complete processing results
+        """
+        try:
+            result = {
+                "success": False,
+                "modulation_analysis": {},
+                "demodulation": {},
+                "encoding_analysis": {},
+                "decoding": {},
+                "final_data": np.array([])
+            }
+            
+            if len(iq_samples) == 0:
+                return result
+            
+            # Step 1: Modulation Analysis
+            self.logger.debug("Step 1: Analyzing modulation...")
+            mod_analysis = self.analyze_modulation(iq_samples)
+            result["modulation_analysis"] = mod_analysis
+            
+            # Step 2: Demodulation
+            mod_type = mod_analysis.get("type", "Unknown")
+            self.logger.debug(f"Step 2: Demodulating {mod_type}...")
+            
+            if mod_type != "Unknown":
+                demod_result = self.demodulate_signal(
+                    iq_samples,
+                    mod_type,
+                    mod_analysis.get("parameters", {})
+                )
+                result["demodulation"] = demod_result
+                
+                # Extract demodulated data
+                demod_data = demod_result.get("demodulated_data", np.array([]))
+                
+                # Step 3: Encoding Analysis (for digital data)
+                if demod_result.get("data_type") == "digital" and len(demod_data) > 0:
+                    self.logger.debug("Step 3: Analyzing encoding...")
+                    
+                    # Convert to binary if needed
+                    if demod_data.dtype == bool:
+                        binary_data = demod_data.astype(np.uint8)
+                    elif demod_data.dtype in [np.int8, np.int16, np.int32, np.int64]:
+                        binary_data = np.clip(demod_data, 0, 1).astype(np.uint8)
+                    else:
+                        # Float data - threshold to binary
+                        threshold = np.mean(demod_data) if len(demod_data) > 0 else 0.5
+                        binary_data = (demod_data > threshold).astype(np.uint8)
+                    
+                    enc_analysis = self.analyze_encoding(binary_data)
+                    result["encoding_analysis"] = enc_analysis
+                    
+                    # Step 4: Decoding
+                    if enc_analysis["type"] != "None" and enc_analysis["confidence"] > 0.3:
+                        self.logger.debug(f"Step 4: Decoding {enc_analysis['type']}...")
+                        decode_result = self.decode_data(
+                            binary_data,
+                            enc_analysis["type"],
+                            enc_analysis["parameters"]
+                        )
+                        result["decoding"] = decode_result
+                        result["final_data"] = decode_result.get("decoded_data", binary_data)
+                    else:
+                        result["final_data"] = binary_data
+                else:
+                    # For analog data, final data is the demodulated output
+                    result["final_data"] = demod_data
+            else:
+                # Unknown modulation - pass through raw IQ
+                result["final_data"] = iq_samples
+            
+            result["success"] = True
+            self.logger.debug("Complete processing chain completed successfully")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Complete processing chain error: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "modulation_analysis": {},
+                "demodulation": {},
+                "encoding_analysis": {},
+                "decoding": {},
+                "final_data": np.array([])
+            }
+
     def update_sample_rate(self, sample_rate: float):
         """Update sample rate for modulation analysis engines."""
         try:

@@ -106,9 +106,40 @@ class ControlsWidget(QWidget):
         device_layout = QFormLayout(device_group)
         
         self.device_combo = QComboBox()
-        self.device_combo.addItems(['rtlsdr', 'hackrf', 'pluto', 'usrp', 'soapy', 'file'])
+        self.device_combo.addItems(['rtlsdr', 'hackrf', 'pluto', 'usrp', 'USRP N2xx/X3xx Series', 'soapy', 'file'])
         self.device_combo.currentTextChanged.connect(self.device_changed.emit)
         device_layout.addRow("Device Type:", self.device_combo)
+        
+        # Status indicators section
+        status_layout = QHBoxLayout()
+        
+        # Ready status
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("QLabel { font-weight: bold; color: green; }")
+        status_layout.addWidget(QLabel("Status:"))
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch()
+        
+        # FPS indicator
+        self.fps_label = QLabel("FPS: 0")
+        self.fps_label.setStyleSheet("QLabel { font-weight: bold; }")
+        status_layout.addWidget(self.fps_label)
+        
+        device_layout.addRow("", status_layout)
+        
+        # Device status and frequency info
+        info_layout = QHBoxLayout()
+        
+        self.device_status_label = QLabel("Device: Disconnected")
+        self.device_status_label.setStyleSheet("QLabel { color: red; }")
+        info_layout.addWidget(self.device_status_label)
+        info_layout.addStretch()
+        
+        self.frequency_label = QLabel("Freq: 0 MHz")
+        self.frequency_label.setStyleSheet("QLabel { font-weight: bold; }")
+        info_layout.addWidget(self.frequency_label)
+        
+        device_layout.addRow("", info_layout)
         
         layout.addWidget(device_group)
         
@@ -403,6 +434,12 @@ class ControlsWidget(QWidget):
         self.spectrum_rate_spinbox.setValue(self.settings.gui.spectrum_update_rate)
         self.waterfall_rate_spinbox.setValue(self.settings.gui.waterfall_update_rate)
         self.theme_combo.setCurrentText(self.settings.gui.theme)
+        
+        # Initialize status indicators
+        self.update_status("Ready")
+        self.update_fps(0)
+        self.update_device_status(self.settings.sdr.device_type, False)
+        self.update_frequency_display(self.settings.sdr.center_frequency)
     
     def set_acquisition_state(self, active: bool):
         """Update controls based on acquisition state."""
@@ -547,3 +584,30 @@ class ControlsWidget(QWidget):
         if self.auto_detect_coding_checkbox.isChecked():
             self.encoding_combo.setCurrentText(encoding)
             self.encoding_detected.emit(encoding)
+    
+    def update_status(self, status: str):
+        """Update the ready status indicator."""
+        self.status_label.setText(status)
+        if "Ready" in status:
+            self.status_label.setStyleSheet("QLabel { font-weight: bold; color: green; }")
+        elif "Running" in status or "Active" in status:
+            self.status_label.setStyleSheet("QLabel { font-weight: bold; color: blue; }")
+        else:
+            self.status_label.setStyleSheet("QLabel { font-weight: bold; color: orange; }")
+    
+    def update_fps(self, fps: int):
+        """Update the FPS indicator."""
+        self.fps_label.setText(f"FPS: {fps}")
+    
+    def update_device_status(self, device: str, connected: bool):
+        """Update the device status indicator."""
+        if connected:
+            self.device_status_label.setText(f"Device: {device} (Connected)")
+            self.device_status_label.setStyleSheet("QLabel { color: green; }")
+        else:
+            self.device_status_label.setText(f"Device: {device} (Disconnected)")
+            self.device_status_label.setStyleSheet("QLabel { color: red; }")
+    
+    def update_frequency_display(self, frequency: float):
+        """Update the frequency display."""
+        self.frequency_label.setText(f"Freq: {frequency/1e6:.3f} MHz")

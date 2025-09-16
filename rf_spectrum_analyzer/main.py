@@ -101,7 +101,7 @@ def main():
         
         # Create and run main application
         rf_app = RFSpectrumAnalyzerApp(settings)
-        rf_app.show()
+        # Main window is shown from within the app initialization
         
         logger.info("RF Spectrum Analyzer started successfully")
         

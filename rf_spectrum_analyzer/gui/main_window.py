@@ -19,13 +19,15 @@ import pyqtgraph as pg
 from rf_spectrum_analyzer.gui.spectrum_widget import SpectrumWidget
 from rf_spectrum_analyzer.gui.waterfall_widget import WaterfallWidget
 from rf_spectrum_analyzer.gui.controls_widget import ControlsWidget
+from rf_spectrum_analyzer.gui.constellation_widget import ConstellationWidget
+from rf_spectrum_analyzer.gui.bitstream_widget import BitstreamWidget
 from rf_spectrum_analyzer.config.settings import Settings
 
 # Set PyQtGraph options for better performance
 pg.setConfigOptions(antialias=True, useOpenGL=True)
 
 
-class MainWindow(QWidget):
+class MainWindow(QMainWindow):
     """Main window widget containing all GUI components."""
     
     # Signals for communication with application
@@ -39,9 +41,10 @@ class MainWindow(QWidget):
     window_changed = Signal(str)
     averaging_changed = Signal(int)
     
-    def __init__(self, settings: Settings, parent=None):
+    def __init__(self, settings: Settings, app=None, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.app = app  # Reference to main application
         self.acquisition_active = False
         
         # Performance monitoring
@@ -57,8 +60,12 @@ class MainWindow(QWidget):
     
     def setup_ui(self):
         """Setup the user interface layout."""
-        # Main layout
-        main_layout = QHBoxLayout(self)
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Main layout for central widget
+        main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
         
@@ -79,11 +86,17 @@ class MainWindow(QWidget):
         display_widget = self.create_display_area()
         main_splitter.addWidget(display_widget)
         
+        # Create constellation dock widget
+        self.create_constellation_dock()
+        
+        # Create bitstream dock widget
+        self.create_bitstream_dock()
+        
+        # Create menu bar
+        self.create_menu_bar()
+        
         # Set splitter proportions
         main_splitter.setSizes([300, 900])
-        
-        # Create status bar
-        self.create_status_bar()
         
         # Set window properties
         self.setWindowTitle("RF Spectrum Analyzer")
@@ -123,26 +136,170 @@ class MainWindow(QWidget):
         
         return display_widget
     
-    def create_status_bar(self):
-        """Create status bar with performance indicators."""
-        # Note: Since we're inheriting from QWidget, we'll create a custom status area
-        status_layout = QHBoxLayout()
+    def create_constellation_dock(self):
+        """Create constellation dock widget that can be detached."""
+        # Create constellation widget
+        self.constellation_widget = ConstellationWidget()
         
-        # Status labels
-        from PySide6.QtWidgets import QLabel
-        self.status_label = QLabel("Ready")
-        self.fps_label = QLabel("FPS: 0")
-        self.device_status_label = QLabel("Device: Disconnected")
-        self.frequency_label = QLabel("Freq: 0 MHz")
+        # Create dock widget for constellation
+        self.constellation_dock = QDockWidget("Constellation Display", self)
+        self.constellation_dock.setWidget(self.constellation_widget)
         
-        status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
-        status_layout.addWidget(self.fps_label)
-        status_layout.addWidget(self.device_status_label)
-        status_layout.addWidget(self.frequency_label)
+        # Set dock widget properties
+        self.constellation_dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
         
-        # Add status bar to main layout
-        self.layout().addLayout(status_layout)
+        # Set size hints for better layout
+        self.constellation_dock.setMinimumSize(400, 300)
+        self.constellation_dock.resize(500, 400)
+        
+        # Add dock widget to main window (initially on the right)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.constellation_dock)
+        
+        # Connect dock widget signals
+        self.constellation_dock.visibilityChanged.connect(self.on_constellation_visibility_changed)
+        self.constellation_dock.topLevelChanged.connect(self.on_constellation_floating_changed)
+        
+        # Set default state
+        self.constellation_dock.setFloating(False)
+        self.constellation_dock.show()
+    
+    def create_bitstream_dock(self):
+        """Create bitstream dock widget that can be detached."""
+        # Create bitstream widget
+        self.bitstream_widget = BitstreamWidget()
+        
+        # Create dock widget for bitstream
+        self.bitstream_dock = QDockWidget("Bitstream Display", self)
+        self.bitstream_dock.setWidget(self.bitstream_widget)
+        
+        # Set dock widget properties
+        self.bitstream_dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        
+        # Set size hints for better layout
+        self.bitstream_dock.setMinimumSize(500, 350)
+        self.bitstream_dock.resize(600, 450)
+        
+        # Add dock widget to main window (initially on the bottom)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.bitstream_dock)
+        
+        # Connect dock widget signals
+        self.bitstream_dock.visibilityChanged.connect(self.on_bitstream_visibility_changed)
+        self.bitstream_dock.topLevelChanged.connect(self.on_bitstream_floating_changed)
+        
+        # Set default state
+        self.bitstream_dock.setFloating(False)
+        self.bitstream_dock.show()
+    
+    def on_bitstream_visibility_changed(self, visible: bool):
+        """Handle bitstream dock visibility change."""
+        if hasattr(self, 'view_menu'):
+            # Update menu check state if menu exists
+            self.bitstream_action.setChecked(visible)
+    
+    def on_bitstream_floating_changed(self, floating: bool):
+        """Handle bitstream dock floating state change."""
+        if floating:
+            # When floating, set a nice window icon and title
+            self.bitstream_dock.setWindowIcon(self.windowIcon())
+            self.bitstream_dock.setWindowTitle("Bitstream Display - RF Spectrum Analyzer")
+            
+            # Set optimal size for floating window
+            self.bitstream_dock.resize(700, 550)
+    
+    def toggle_bitstream_dock(self):
+        """Toggle bitstream dock visibility."""
+        if self.bitstream_dock.isVisible():
+            self.bitstream_dock.hide()
+        else:
+            self.bitstream_dock.show()
+    
+    def on_constellation_visibility_changed(self, visible: bool):
+        """Handle constellation dock visibility change."""
+        if hasattr(self, 'view_menu'):
+            # Update menu check state if menu exists
+            self.constellation_action.setChecked(visible)
+    
+    def on_constellation_floating_changed(self, floating: bool):
+        """Handle constellation dock floating state change."""
+        if floating:
+            # When floating, set a nice window icon and title
+            self.constellation_dock.setWindowIcon(self.windowIcon())
+            self.constellation_dock.setWindowTitle("Constellation Display - RF Spectrum Analyzer")
+            
+            # Set optimal size for floating window
+            self.constellation_dock.resize(600, 500)
+    
+    def toggle_constellation_dock(self):
+        """Toggle constellation dock visibility."""
+        if self.constellation_dock.isVisible():
+            self.constellation_dock.hide()
+        else:
+            self.constellation_dock.show()
+    
+    def reset_dock_layout(self):
+        """Reset dock widgets to default layout."""
+        self.constellation_dock.setFloating(False)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.constellation_dock)
+        self.constellation_dock.show()
+        
+        self.bitstream_dock.setFloating(False)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.bitstream_dock)
+        self.bitstream_dock.show()
+    
+    def create_menu_bar(self):
+        """Create menu bar with view options."""
+        menubar = self.menuBar()
+        
+        # View menu
+        self.view_menu = menubar.addMenu('&View')
+        
+        # Constellation display toggle
+        self.constellation_action = QAction('&Constellation Display', self)
+        self.constellation_action.setCheckable(True)
+        self.constellation_action.setChecked(True)
+        self.constellation_action.setShortcut('Ctrl+D')
+        self.constellation_action.triggered.connect(self.toggle_constellation_dock)
+        self.view_menu.addAction(self.constellation_action)
+        
+        # Bitstream display toggle
+        self.bitstream_action = QAction('&Bitstream Display', self)
+        self.bitstream_action.setCheckable(True)
+        self.bitstream_action.setChecked(True)
+        self.bitstream_action.setShortcut('Ctrl+B')
+        self.bitstream_action.triggered.connect(self.toggle_bitstream_dock)
+        self.view_menu.addAction(self.bitstream_action)
+        
+        self.view_menu.addSeparator()
+        
+        # Reset layout action
+        reset_layout_action = QAction('&Reset Layout', self)
+        reset_layout_action.setShortcut('Ctrl+R')
+        reset_layout_action.triggered.connect(self.reset_dock_layout)
+        self.view_menu.addAction(reset_layout_action)
+        
+        self.view_menu.addSeparator()
+        
+        # Fullscreen toggle
+        fullscreen_action = QAction('&Fullscreen', self)
+        fullscreen_action.setCheckable(True)
+        fullscreen_action.setShortcut('F11')
+        fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        self.view_menu.addAction(fullscreen_action)
+    
+    def toggle_fullscreen(self):
+        """Toggle fullscreen mode."""
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
     
     def connect_signals(self):
         """Connect internal signals."""
@@ -320,11 +477,11 @@ class MainWindow(QWidget):
         self.controls_widget.set_acquisition_state(active)
         
         if active:
-            self.status_label.setText("Acquiring...")
-            self.device_status_label.setText("Device: Connected")
+            self.controls_widget.update_status("Acquiring...")
+            self.controls_widget.update_device_status("Connected", True)
         else:
-            self.status_label.setText("Stopped")
-            self.device_status_label.setText("Device: Disconnected")
+            self.controls_widget.update_status("Stopped")
+            self.controls_widget.update_device_status("Disconnected", False)
     
     def show_error_message(self, message: str):
         """Show error message to user."""
@@ -357,20 +514,21 @@ class MainWindow(QWidget):
         
         if self.last_time > 0:
             fps = self.frame_count / (current_time - self.last_time)
-            self.fps_label.setText(f"FPS: {fps:.1f}")
+            self.controls_widget.update_fps(int(fps))
         
         self.frame_count = 0
         self.last_time = current_time
     
     def update_frequency_display(self, frequency: float):
-        """Update frequency display in status bar."""
-        self.frequency_label.setText(f"Freq: {frequency/1e6:.3f} MHz")
+        """Update frequency display in device controls."""
+        self.controls_widget.update_frequency_display(frequency)
     
     def update_device_info(self, device_info: Dict[str, Any]):
         """Update device information display."""
         device_type = device_info.get("device_type", "Unknown")
         status = device_info.get("status", "Unknown")
-        self.device_status_label.setText(f"Device: {device_type} ({status})")
+        connected = status.lower() in ["connected", "active", "running"]
+        self.controls_widget.update_device_status(device_type, connected)
     
     def get_current_settings(self) -> Dict[str, Any]:
         """Get current GUI settings."""
@@ -378,6 +536,43 @@ class MainWindow(QWidget):
             "window_geometry": self.geometry(),
             "acquisition_active": self.acquisition_active,
         }
+    
+    def update_constellation(self, iq_data: np.ndarray, symbols: Optional[np.ndarray] = None,
+                           modulation_info: Optional[Dict[str, Any]] = None):
+        """Update constellation display."""
+        if hasattr(self, 'constellation_widget') and self.constellation_widget:
+            self.constellation_widget.update_constellation(iq_data, symbols, modulation_info)
+    
+    def update_bitstream(self, bit_data: np.ndarray):
+        """Update bitstream display with new bit data."""
+        if hasattr(self, 'bitstream_widget') and self.bitstream_widget:
+            # Convert to list of integers if needed
+            if isinstance(bit_data, np.ndarray):
+                # Ensure we have binary data
+                if bit_data.dtype == bool:
+                    bits = bit_data.astype(int).tolist()
+                elif bit_data.dtype in [np.int8, np.int16, np.int32, np.int64]:
+                    # Already integer, just convert to list and ensure binary
+                    bits = np.clip(bit_data, 0, 1).astype(int).tolist()
+                else:
+                    # Float data, threshold to binary
+                    threshold = np.mean(bit_data) if len(bit_data) > 0 else 0.5
+                    bits = (bit_data > threshold).astype(int).tolist()
+            else:
+                bits = bit_data
+            
+            self.bitstream_widget.add_bits(bits)
+    
+    def set_acquisition_state(self, active: bool):
+        """Update acquisition state across all widgets."""
+        self.acquisition_active = active
+        if hasattr(self, 'controls_widget') and self.controls_widget:
+            self.controls_widget.set_acquisition_state(active)
+    
+    def show_error_message(self, message: str):
+        """Show error message to user."""
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(self, "Error", message)
     
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts."""
@@ -399,5 +594,9 @@ class MainWindow(QWidget):
         # Stop acquisition before closing
         if self.acquisition_active:
             self.stop_requested.emit()
+        
+        # Call app shutdown if available
+        if self.app and hasattr(self.app, 'shutdown_application'):
+            self.app.shutdown_application()
         
         event.accept()
