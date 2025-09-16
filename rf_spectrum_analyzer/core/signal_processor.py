@@ -6,6 +6,8 @@ Integrates multiple DSP libraries for comprehensive signal analysis.
 import numpy as np
 import scipy.signal
 import logging
+import os
+import time
 from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 
@@ -127,25 +129,75 @@ class SignalProcessor:
         self._detection_threshold_dbm = -80.0
         self._detection_interval_ms = 100
         
+        # Performance optimization variables
+        self._last_spectrum_time = 0
+        self._spectrum_skip_counter = 0
+        self._adaptive_update_rate = 20  # Target updates per second
+        self._min_update_interval = 1.0 / 30  # Maximum 30 FPS
+        self._performance_mode = 'balanced'  # 'fast', 'balanced', 'quality'
+        
         self.logger.info("Signal processor initialized")
     
     def _setup_fft(self):
-        """Setup FFT objects for optimal performance."""
+        """Setup optimized FFT computation with pyFFTW."""
+        # Create window
+        self.window = self._create_window(self.settings.dsp.window_type, self.fft_size)
+        
+        # Setup averaging with pre-allocated arrays
+        self.averaging = self.settings.dsp.averaging
+        self.spectrum_history = []
+        self._spectrum_sum = None  # Pre-allocated sum array for averaging
+        
+        # Setup optimized FFTW if available
         if PYFFTW_AVAILABLE:
             try:
-                # Setup FFTW for better performance
-                self.fft_input = pyfftw.empty_aligned(self.fft_size, dtype='complex64')
-                self.fft_output = pyfftw.empty_aligned(self.fft_size, dtype='complex64')
-                self.fft_object = pyfftw.FFTW(self.fft_input, self.fft_output, 
+                # Enable FFTW wisdom for optimized FFT plans
+                pyfftw.config.NUM_THREADS = min(4, os.cpu_count() or 1)  # Limit threads for GUI responsiveness
+                pyfftw.config.PLANNER_EFFORT = 'FFTW_MEASURE'
+                
+                # Create cache-aligned arrays for optimal performance
+                self.fft_input = pyfftw.empty_aligned(self.fft_size, dtype='complex64', 
+                                                    n=pyfftw.simd_alignment)
+                self.fft_output = pyfftw.empty_aligned(self.fft_size, dtype='complex64',
+                                                     n=pyfftw.simd_alignment)
+                
+                # Pre-allocate windowed samples array
+                self.windowed_samples = pyfftw.empty_aligned(self.fft_size, dtype='complex64',
+                                                           n=pyfftw.simd_alignment)
+                
+                # Create optimized FFTW object with wisdom
+                self.fft_object = pyfftw.FFTW(self.fft_input, 
+                                            self.fft_output, 
                                             direction='FFTW_FORWARD', 
-                                            flags=('FFTW_MEASURE',))
-                self.fft_method = 'pyfftw'
-                self.logger.info("Using FFTW for FFT computation")
+                                            flags=('FFTW_MEASURE', 'FFTW_DESTROY_INPUT'),
+                                            threads=pyfftw.config.NUM_THREADS)
+                
+                # Pre-allocate power spectrum arrays
+                self._power_spectrum = np.empty(self.fft_size, dtype=np.float32)
+                self._power_db = np.empty(self.fft_size, dtype=np.float32)
+                
+                self.fft_method = 'pyfftw_optimized'
+                self.logger.info(f"Using optimized FFTW with {pyfftw.config.NUM_THREADS} threads for FFT computation")
+                
             except Exception as e:
-                self.logger.warning(f"Failed to setup FFTW: {e}, falling back to numpy")
-                self.fft_method = 'numpy'
+                self.logger.warning(f"Failed to setup optimized FFTW: {e}, falling back to basic FFTW")
+                try:
+                    # Fallback to basic FFTW setup
+                    self.fft_input = pyfftw.empty_aligned(self.fft_size, dtype='complex64')
+                    self.fft_output = pyfftw.empty_aligned(self.fft_size, dtype='complex64')
+                    
+                    self.fft_object = pyfftw.FFTW(self.fft_input, 
+                                                self.fft_output, 
+                                                direction='FFTW_FORWARD', 
+                                                flags=('FFTW_MEASURE',))
+                    self.fft_method = 'pyfftw'
+                    self.logger.info("Using basic FFTW for FFT computation")
+                except Exception as e2:
+                    self.logger.warning(f"Failed to setup basic FFTW: {e2}, falling back to numpy")
+                    self.fft_method = 'numpy'
         else:
             self.fft_method = 'numpy'
+            self.logger.info("Using numpy for FFT computation")
             self.logger.info("Using numpy for FFT computation")
     
     def _create_window(self, window_type: str, size: int) -> np.ndarray:
@@ -165,40 +217,81 @@ class SignalProcessor:
             return scipy.signal.windows.hann(size)
     
     def compute_spectrum(self, iq_samples: np.ndarray) -> Optional[np.ndarray]:
-        """Compute power spectrum from IQ samples."""
+        """Compute power spectrum from IQ samples with optimized FFT and adaptive throttling."""
         try:
+            # Check if we should skip this frame for performance
+            current_time = time.time()
+            time_since_last = current_time - self._last_spectrum_time
+            
+            # Adaptive throttling based on performance mode
+            if self._performance_mode == 'fast':
+                min_interval = 1.0 / 15  # 15 FPS max
+            elif self._performance_mode == 'balanced':
+                min_interval = 1.0 / 20  # 20 FPS max  
+            else:  # quality mode
+                min_interval = 1.0 / 30  # 30 FPS max
+            
+            # Skip frame if updating too frequently
+            if time_since_last < min_interval:
+                self._spectrum_skip_counter += 1
+                return None
+                
+            self._last_spectrum_time = current_time
+            if self._spectrum_skip_counter > 0:
+                self.logger.debug(f"Skipped {self._spectrum_skip_counter} frames for performance")
+                self._spectrum_skip_counter = 0
+            
             if len(iq_samples) < self.fft_size:
                 return None
             
             # Store IQ data for sequential workflow
             self._current_iq_data = iq_samples.copy()
             
-            # Extract samples for FFT
+            # Extract samples for FFT (ensure complex64 for optimal performance)
             samples = iq_samples[:self.fft_size].astype(np.complex64)
             
-            # Apply window
-            windowed_samples = samples * self.window
-            
-            # Compute FFT
-            if self.fft_method == 'pyfftw':
+            # Compute FFT with optimized path
+            if self.fft_method == 'pyfftw_optimized':
+                # Optimized FFTW path with pre-allocated arrays
+                np.multiply(samples, self.window, out=self.windowed_samples)
+                self.fft_input[:] = self.windowed_samples
+                self.fft_object()
+                
+                # Compute power spectrum in-place for better memory efficiency
+                np.abs(self.fft_output, out=self._power_spectrum)
+                np.square(self._power_spectrum, out=self._power_spectrum)
+                
+                # Convert to dB efficiently
+                np.maximum(self._power_spectrum, 1e-12, out=self._power_spectrum)  # Prevent log(0)
+                np.log10(self._power_spectrum, out=self._power_db)
+                self._power_db *= 10.0
+                
+                # FFT shift to center DC
+                power_db_shifted = np.fft.fftshift(self._power_db)
+                
+            elif self.fft_method == 'pyfftw':
+                # Basic FFTW path
+                windowed_samples = samples * self.window
                 self.fft_input[:] = windowed_samples
                 self.fft_object()
                 fft_result = self.fft_output.copy()
+                
+                # Compute power spectrum
+                power_spectrum = np.abs(fft_result) ** 2
+                power_db = 10 * np.log10(power_spectrum + 1e-12)
+                power_db_shifted = np.fft.fftshift(power_db)
+                
             else:
+                # NumPy fallback path
+                windowed_samples = samples * self.window
                 fft_result = np.fft.fft(windowed_samples)
+                power_spectrum = np.abs(fft_result) ** 2
+                power_db = 10 * np.log10(power_spectrum + 1e-12)
+                power_db_shifted = np.fft.fftshift(power_db)
             
-            # Compute power spectrum
-            power_spectrum = np.abs(fft_result) ** 2
-            
-            # Convert to dB
-            power_db = 10 * np.log10(power_spectrum + 1e-12)
-            
-            # FFT shift to center DC
-            power_db_shifted = np.fft.fftshift(power_db)
-            
-            # Apply averaging if enabled
+            # Apply optimized averaging if enabled
             if self.averaging > 1:
-                power_db_shifted = self._apply_averaging(power_db_shifted)
+                power_db_shifted = self._apply_optimized_averaging(power_db_shifted)
             
             return power_db_shifted
             
@@ -216,6 +309,29 @@ class SignalProcessor:
         
         # Return averaged spectrum
         return np.mean(self.spectrum_history, axis=0)
+    
+    def _apply_optimized_averaging(self, spectrum: np.ndarray) -> np.ndarray:
+        """Apply optimized spectrum averaging with reduced memory allocations."""
+        if self._spectrum_sum is None:
+            # Initialize accumulator array
+            self._spectrum_sum = np.zeros_like(spectrum, dtype=np.float64)
+            self.spectrum_history = []
+        
+        # Add new spectrum to history
+        self.spectrum_history.append(spectrum.copy())
+        
+        # Remove old spectrum if we exceed averaging count
+        if len(self.spectrum_history) > self.averaging:
+            old_spectrum = self.spectrum_history.pop(0)
+            # Update running sum efficiently
+            self._spectrum_sum += spectrum
+            self._spectrum_sum -= old_spectrum
+        else:
+            # Still building up history
+            self._spectrum_sum += spectrum
+        
+        # Return efficiently computed average
+        return (self._spectrum_sum / len(self.spectrum_history)).astype(np.float32)
     
     def compute_detailed_spectrum(self, iq_samples: np.ndarray) -> Optional[SpectrumData]:
         """Compute detailed spectrum analysis."""
@@ -1644,3 +1760,24 @@ class SignalProcessor:
         except Exception as e:
             self.logger.error(f"Error detecting coding type: {e}")
             return {"success": False, "error": str(e)}
+    
+    def set_performance_mode(self, mode: str):
+        """Set performance mode for spectrum computation.
+        
+        Args:
+            mode: 'fast' (15 FPS), 'balanced' (20 FPS), 'quality' (30 FPS)
+        """
+        if mode in ['fast', 'balanced', 'quality']:
+            self._performance_mode = mode
+            self.logger.info(f"Performance mode set to: {mode}")
+        else:
+            self.logger.warning(f"Invalid performance mode: {mode}")
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics."""
+        return {
+            'fft_method': self.fft_method,
+            'performance_mode': self._performance_mode,
+            'frames_skipped': self._spectrum_skip_counter,
+            'last_update_time': self._last_spectrum_time
+        }

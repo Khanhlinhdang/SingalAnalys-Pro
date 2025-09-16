@@ -35,7 +35,14 @@ This is a comprehensive Software Defined Radio (SDR) spectrum analysis applicati
 ## Development Workflows
 
 ### Running the Application
+
+**IMPORTANT**: Always use the project's virtual environment (`.venv`) for consistent dependency management.
+
 ```bash
+# Activate virtual environment first
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Linux/macOS
+
 # Demo mode (synthetic data)
 python main.py --demo
 
@@ -44,10 +51,22 @@ python main.py --device spyserver
 
 # With specific parameters
 python main.py --device spyserver --frequency 100e6 --sample-rate 2.4e6
+
+# Deactivate when done
+deactivate
 ```
 
 ### Testing System
+
+**IMPORTANT**: Always run tests in the project's virtual environment (`.venv`) to ensure consistent dependencies and avoid conflicts.
+
 ```bash
+# Activate virtual environment first (Windows)
+.venv\Scripts\activate
+
+# Activate virtual environment first (Linux/macOS)
+source .venv/bin/activate
+
 # Fast tests (DSP, imports, basic functionality)
 python rf_spectrum_analyzer/tests/run_tests.py --fast
 
@@ -60,6 +79,21 @@ rf_spectrum_analyzer/tests/run_local_tests.bat --all --coverage   # Windows
 
 # Structure validation
 python test_implementation_structure.py
+
+# Deactivate virtual environment when done
+deactivate
+```
+
+**Virtual Environment Setup** (if not exists):
+```bash
+# Create virtual environment
+python -m venv .venv
+
+# Activate and install dependencies
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Linux/macOS
+pip install -r requirements.txt
+pip install -r rf_spectrum_analyzer/requirements.txt
 ```
 
 ### Integration Testing Pattern
@@ -133,8 +167,9 @@ self.spectrum.frequency_markers_toggled.connect(self._on_frequency_markers_toggl
 
 ## Important Constraints
 
-1. **SpyServer First**: Default to SpyServer backend unless explicitly specified
-2. **Real-Time Performance**: Use Qt signals for thread-safe GUI updates
-3. **Graceful Degradation**: Handle missing optional dependencies elegantly
-4. **Data Type Safety**: Always validate numpy array types in DSP code
-5. **Test-Driven**: Validate changes with `test_implementation_structure.py` before completion
+1. **Virtual Environment**: Always use the project's `.venv` virtual environment for testing and development to ensure consistent dependencies
+2. **SpyServer First**: Default to SpyServer backend unless explicitly specified
+3. **Real-Time Performance**: Use Qt signals for thread-safe GUI updates
+4. **Graceful Degradation**: Handle missing optional dependencies elegantly
+5. **Data Type Safety**: Always validate numpy array types in DSP code
+6. **Test-Driven**: Validate changes with `test_implementation_structure.py` before completion

@@ -251,6 +251,28 @@ class SpyServerBackend(SDRBackend):
             logger.error(f"Error setting SpyServer gain: {e}")
             return False
     
+    def set_bandwidth(self, bandwidth: float) -> bool:
+        """Set bandwidth - SpyServer specific implementation."""
+        if not self.connected or not self.spyserver_client:
+            logger.error("SpyServer not connected")
+            return False
+        
+        try:
+            # SpyServer bandwidth is often tied to sample rate
+            # For most SpyServer implementations, bandwidth = sample_rate
+            # Some may support separate bandwidth setting
+            if hasattr(self.spyserver_client, 'set_bandwidth'):
+                self.spyserver_client.set_bandwidth(int(bandwidth))
+                logger.debug(f"SpyServer bandwidth set to {bandwidth}")
+            else:
+                # Fallback: use sample rate as effective bandwidth
+                logger.info(f"SpyServer bandwidth control via sample rate: {bandwidth}")
+                self.set_sample_rate(bandwidth)
+            return True
+        except Exception as e:
+            logger.error(f"Error setting SpyServer bandwidth: {e}")
+            return False
+    
     def start_streaming(self) -> bool:
         """Start IQ streaming."""
         if not self.connected or not self.spyserver_client:

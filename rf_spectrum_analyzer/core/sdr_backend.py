@@ -596,6 +596,12 @@ class SDRBackendManager:
             return self.current_backend.set_sample_rate(sample_rate)
         return False
     
+    def set_bandwidth(self, bandwidth: float) -> bool:
+        """Set bandwidth."""
+        if self.current_backend and hasattr(self.current_backend, 'set_bandwidth'):
+            return self.current_backend.set_bandwidth(bandwidth)
+        return False
+    
     def set_gain(self, gain: float) -> bool:
         """Set RF gain."""
         if self.current_backend:

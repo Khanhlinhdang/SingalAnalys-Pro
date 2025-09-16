@@ -5,6 +5,8 @@ Integrates sdrconnect's analyze_signal functionality into RF Spectrum Analyzer
 
 import numpy as np
 import logging
+import os
+import time
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
@@ -13,6 +15,12 @@ try:
     SDRCONNECT_AVAILABLE = True
 except ImportError:
     SDRCONNECT_AVAILABLE = False
+
+try:
+    import pyfftw
+    PYFFTW_AVAILABLE = True
+except ImportError:
+    PYFFTW_AVAILABLE = False
 
 from rf_spectrum_analyzer.utils.logger import get_logger
 
@@ -61,8 +69,53 @@ class EnhancedSignalAnalysis:
         self.fft_size = fft_size
         self.sdrconnect_available = SDRCONNECT_AVAILABLE
         
+        # Setup optimized FFT processing
+        self._setup_optimized_fft()
+        
+        # Performance tracking
+        self._fft_computation_times = []
+        self._last_analysis_time = 0
+        
         if not self.sdrconnect_available:
             logger.warning("sdrconnect not available. Using basic analysis only.")
+            
+        logger.info(f"Enhanced Signal Analysis initialized with FFT method: {self.fft_method}")
+    
+    def _setup_optimized_fft(self):
+        """Setup optimized FFT computation with pyFFTW."""
+        # Setup optimized FFTW if available
+        if PYFFTW_AVAILABLE:
+            try:
+                # Configure FFTW for optimal performance
+                pyfftw.config.NUM_THREADS = min(2, os.cpu_count() or 1)  # Limit threads for analysis
+                pyfftw.config.PLANNER_EFFORT = 'FFTW_MEASURE'
+                
+                # Create cache-aligned arrays for optimal performance
+                self.fft_input = pyfftw.empty_aligned(self.fft_size, dtype='complex64', 
+                                                    n=pyfftw.simd_alignment)
+                self.fft_output = pyfftw.empty_aligned(self.fft_size, dtype='complex64',
+                                                     n=pyfftw.simd_alignment)
+                
+                # Pre-allocate working arrays
+                self._power_spectrum = np.empty(self.fft_size, dtype=np.float32)
+                self._power_db = np.empty(self.fft_size, dtype=np.float32)
+                
+                # Create optimized FFTW object
+                self.fft_object = pyfftw.FFTW(self.fft_input, 
+                                            self.fft_output, 
+                                            direction='FFTW_FORWARD', 
+                                            flags=('FFTW_MEASURE', 'FFTW_DESTROY_INPUT'),
+                                            threads=pyfftw.config.NUM_THREADS)
+                
+                self.fft_method = 'pyfftw_optimized'
+                logger.info(f"Using optimized FFTW with {pyfftw.config.NUM_THREADS} threads for enhanced analysis")
+                
+            except Exception as e:
+                logger.warning(f"Failed to setup optimized FFTW: {e}, falling back to numpy")
+                self.fft_method = 'numpy'
+        else:
+            self.fft_method = 'numpy'
+            logger.info("Using numpy for FFT computation in enhanced analysis")
     
     def analyze_iq_data(self, iq_data: np.ndarray) -> EnhancedAnalysisResult:
         """
@@ -92,11 +145,35 @@ class EnhancedSignalAnalysis:
             return basic_result
     
     def _basic_analysis(self, iq_data: np.ndarray) -> EnhancedAnalysisResult:
-        """Perform basic analysis compatible with existing system."""
+        """Perform optimized basic analysis using pyFFTW."""
+        start_time = time.time()
         
-        # Power Spectrum Density
-        fft_data = np.fft.fftshift(np.fft.fft(iq_data[:self.fft_size]))
-        power_spectrum = 20 * np.log10(np.abs(fft_data) + 1e-12)
+        # Extract samples for FFT (ensure complex64 for optimal performance)
+        samples = iq_data[:self.fft_size].astype(np.complex64)
+        
+        # Compute FFT with optimized path
+        if self.fft_method == 'pyfftw_optimized':
+            # Optimized FFTW path
+            self.fft_input[:] = samples
+            self.fft_object()
+            
+            # Compute power spectrum in-place for better memory efficiency
+            np.abs(self.fft_output, out=self._power_spectrum)
+            np.square(self._power_spectrum, out=self._power_spectrum)
+            
+            # Convert to dB efficiently
+            np.maximum(self._power_spectrum, 1e-12, out=self._power_spectrum)  # Prevent log(0)
+            np.log10(self._power_spectrum, out=self._power_db)
+            self._power_db *= 20.0  # 20*log10 for power spectrum
+            
+            # FFT shift to center DC
+            power_spectrum = np.fft.fftshift(self._power_db)
+            
+        else:
+            # NumPy fallback path
+            fft_data = np.fft.fft(samples)
+            power_spectrum = 20 * np.log10(np.abs(fft_data) + 1e-12)
+            power_spectrum = np.fft.fftshift(power_spectrum)
         
         # Frequency axis
         frequency_axis = np.linspace(-self.sample_rate/2, self.sample_rate/2, self.fft_size)
@@ -118,13 +195,19 @@ class EnhancedSignalAnalysis:
         noise_power = np.median(power_spectrum)  # Median as noise floor estimate
         snr_estimate = signal_power - noise_power
         
+        # Track performance
+        computation_time = time.time() - start_time
+        self._fft_computation_times.append(computation_time)
+        if len(self._fft_computation_times) > 100:  # Keep last 100 measurements
+            self._fft_computation_times.pop(0)
+        
         return EnhancedAnalysisResult(
             power_spectrum=power_spectrum,
             frequency_axis=frequency_axis,
             peak_frequency=peak_frequency,
             bandwidth=bandwidth,
             snr_estimate=snr_estimate,
-            analysis_method="basic",
+            analysis_method=f"basic_{self.fft_method}",
             sdrconnect_available=False
         )
     
@@ -225,6 +308,8 @@ class EnhancedSignalAnalysis:
             'sdrconnect_available': self.sdrconnect_available,
             'sample_rate': self.sample_rate,
             'fft_size': self.fft_size,
+            'fft_method': self.fft_method,
+            'pyfftw_available': PYFFTW_AVAILABLE,
             'enhanced_features': [
                 'spectrogram',
                 'advanced_metrics',
@@ -235,3 +320,28 @@ class EnhancedSignalAnalysis:
                 'dc_offset_analysis'
             ] if self.sdrconnect_available else ['basic_spectrum']
         }
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics for FFT operations."""
+        if not self._fft_computation_times:
+            return {
+                'fft_method': self.fft_method,
+                'average_computation_time_ms': 0.0,
+                'measurements_count': 0
+            }
+        
+        avg_time = np.mean(self._fft_computation_times) * 1000  # Convert to ms
+        return {
+            'fft_method': self.fft_method,
+            'average_computation_time_ms': float(avg_time),
+            'min_computation_time_ms': float(np.min(self._fft_computation_times) * 1000),
+            'max_computation_time_ms': float(np.max(self._fft_computation_times) * 1000),
+            'measurements_count': len(self._fft_computation_times),
+            'pyfftw_available': PYFFTW_AVAILABLE,
+            'threads_used': getattr(pyfftw.config, 'NUM_THREADS', 1) if PYFFTW_AVAILABLE else 1
+        }
+    
+    def reset_performance_stats(self):
+        """Reset performance tracking statistics."""
+        self._fft_computation_times = []
+        logger.info("Enhanced analysis performance statistics reset")

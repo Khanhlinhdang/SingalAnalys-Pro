@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, 
     QSlider, QCheckBox, QTabWidget, QFormLayout, QLineEdit
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QFont, QValidator
 
 from rf_spectrum_analyzer.config.settings import Settings
@@ -40,6 +40,7 @@ class ControlsWidget(QWidget):
     device_changed = Signal(str)
     frequency_changed = Signal(float)
     sample_rate_changed = Signal(float)
+    bandwidth_changed = Signal(float)  # New signal for bandwidth
     gain_changed = Signal(float)
     fft_size_changed = Signal(int)
     window_changed = Signal(str)
@@ -181,6 +182,7 @@ class ControlsWidget(QWidget):
         self.frequency_input = QLineEdit()
         self.frequency_input.setValidator(FrequencyValidator())
         self.frequency_input.editingFinished.connect(self._on_frequency_changed)
+        self.frequency_input.textChanged.connect(self._on_frequency_typing)  # Real-time while typing
         freq_layout.addRow("Center Freq (MHz):", self.frequency_input)
         
         # Frequency presets
@@ -205,6 +207,13 @@ class ControlsWidget(QWidget):
         self.sample_rate_combo.addItems([f"{rate} MHz" for rate in sample_rates])
         self.sample_rate_combo.currentTextChanged.connect(self._on_sample_rate_changed)
         radio_layout.addRow("Sample Rate:", self.sample_rate_combo)
+        
+        # Bandwidth control
+        self.bandwidth_combo = QComboBox()
+        bandwidths = ["0.25", "0.5", "1.0", "2.0", "2.4", "3.2", "5.0", "8.0", "10.0", "20.0"]
+        self.bandwidth_combo.addItems([f"{bw} MHz" for bw in bandwidths])
+        self.bandwidth_combo.currentTextChanged.connect(self._on_bandwidth_changed)
+        radio_layout.addRow("Bandwidth:", self.bandwidth_combo)
         
         # RF Gain
         self.gain_spinbox = QDoubleSpinBox()
@@ -742,6 +751,13 @@ class ControlsWidget(QWidget):
                 self.sample_rate_combo.setCurrentIndex(i)
                 break
         
+        # Bandwidth
+        bandwidth_mhz = self.settings.sdr.bandwidth / 1e6
+        for i in range(self.bandwidth_combo.count()):
+            if f"{bandwidth_mhz:.1f}" in self.bandwidth_combo.itemText(i):
+                self.bandwidth_combo.setCurrentIndex(i)
+                break
+        
         # Processing settings
         self.fft_size_combo.setCurrentText(str(self.settings.dsp.fft_size))
         self.window_combo.setCurrentText(self.settings.dsp.window_type)
@@ -811,15 +827,61 @@ class ControlsWidget(QWidget):
         self.frequency_input.setText(f"{frequency/1e6:.3f}")
     
     # Event handlers
+    def _on_frequency_typing(self, text: str):
+        """Handle real-time frequency input while typing."""
+        try:
+            # Only emit if we have a valid number
+            if text and text.replace('.', '').replace('-', '').isdigit():
+                freq_mhz = float(text)
+                frequency = freq_mhz * 1e6
+                
+                # Show typing feedback with light blue background
+                self.frequency_input.setStyleSheet("QLineEdit { background-color: #F0F8FF; }")
+                
+                # Use timer to debounce rapid typing
+                if hasattr(self, '_freq_timer'):
+                    self._freq_timer.stop()
+                    
+                self._freq_timer = QTimer()
+                self._freq_timer.timeout.connect(lambda: self._emit_frequency_change(frequency))
+                self._freq_timer.setSingleShot(True)
+                self._freq_timer.start(300)  # 300ms delay
+                
+        except ValueError:
+            # Show invalid input with light red background
+            self.frequency_input.setStyleSheet("QLineEdit { background-color: #FFF8F8; }")
+    
+    def _emit_frequency_change(self, frequency: float):
+        """Emit frequency change after debounce delay."""
+        self.frequency_changed.emit(frequency)
+        self.settings.sdr.center_frequency = frequency
+        # Reset to normal background
+        self.frequency_input.setStyleSheet("")
+        # Update status
+        self.status_label.setText(f"Frequency: {frequency/1e6:.3f} MHz")
+        self.status_label.setStyleSheet("QLabel { font-weight: bold; color: blue; }")
+        QTimer.singleShot(2000, lambda: self._reset_status_label())
+    
     def _on_frequency_changed(self):
-        """Handle frequency input change."""
+        """Handle frequency input change with real-time feedback."""
         try:
             freq_mhz = float(self.frequency_input.text())
             frequency = freq_mhz * 1e6
+            
+            # Provide immediate visual feedback
+            self.frequency_input.setStyleSheet("QLineEdit { background-color: #E8F5E8; }")  # Green background
+            
+            # Emit signal for real-time change
             self.frequency_changed.emit(frequency)
             self.settings.sdr.center_frequency = frequency
+            
+            # Reset background color after short delay
+            QTimer.singleShot(500, lambda: self.frequency_input.setStyleSheet(""))
+            
         except ValueError:
-            pass
+            # Show error feedback
+            self.frequency_input.setStyleSheet("QLineEdit { background-color: #FFE8E8; }")  # Red background
+            QTimer.singleShot(1000, lambda: self.frequency_input.setStyleSheet(""))
     
     def _on_sample_rate_changed(self, rate_text: str):
         """Handle sample rate change."""
@@ -830,6 +892,37 @@ class ControlsWidget(QWidget):
             self.settings.sdr.sample_rate = sample_rate
         except (ValueError, IndexError):
             pass
+    
+    def _on_bandwidth_changed(self, bw_text: str):
+        """Handle bandwidth change with real-time feedback."""
+        try:
+            bw_mhz = float(bw_text.split()[0])
+            bandwidth = bw_mhz * 1e6
+            
+            # Provide immediate visual feedback
+            self.bandwidth_combo.setStyleSheet("QComboBox { background-color: #E8F5E8; }")  # Green background
+            
+            # Emit signal for real-time change
+            self.bandwidth_changed.emit(bandwidth)
+            
+            # Add bandwidth to settings if not exists
+            if not hasattr(self.settings.sdr, 'bandwidth'):
+                self.settings.sdr.bandwidth = bandwidth
+            else:
+                self.settings.sdr.bandwidth = bandwidth
+            
+            # Update status
+            self.status_label.setText(f"Bandwidth: {bw_mhz:.1f} MHz")
+            self.status_label.setStyleSheet("QLabel { font-weight: bold; color: blue; }")
+            
+            # Reset background color after short delay
+            QTimer.singleShot(500, lambda: self.bandwidth_combo.setStyleSheet(""))
+            QTimer.singleShot(2000, lambda: self._reset_status_label())
+            
+        except (ValueError, IndexError):
+            # Show error feedback
+            self.bandwidth_combo.setStyleSheet("QComboBox { background-color: #FFE8E8; }")  # Red background
+            QTimer.singleShot(1000, lambda: self.bandwidth_combo.setStyleSheet(""))
     
     def _on_fft_size_changed(self, size_text: str):
         """Handle FFT size change."""
@@ -1165,11 +1258,24 @@ class ControlsWidget(QWidget):
     
     def update_frequency_range_from_spectrum(self, f1: float, f2: float):
         """Update frequency range controls from spectrum widget interaction."""
+        # Temporarily disconnect signals to avoid recursion
+        self.freq_start_spinbox.valueChanged.disconnect(self._on_frequency_range_changed)
+        self.freq_end_spinbox.valueChanged.disconnect(self._on_frequency_range_changed)
+        
         self.freq_start_spinbox.setValue(f1 / 1e6)  # Convert Hz to MHz
         self.freq_end_spinbox.setValue(f2 / 1e6)
         
-        # Automatically adjust f2 to maintain 2MHz bandwidth
-        self._enforce_2mhz_bandwidth()
+        # Automatically adjust f2 to maintain 2MHz bandwidth without emitting signals
+        f1_val = self.freq_start_spinbox.value()
+        f2_val = f1_val + 2.0  # Always 2MHz bandwidth
+        self.freq_end_spinbox.setValue(f2_val)
+        
+        # Update bandwidth display
+        self.bandwidth_label.setText("2.000 MHz")
+        
+        # Reconnect signals
+        self.freq_start_spinbox.valueChanged.connect(self._on_frequency_range_changed)
+        self.freq_end_spinbox.valueChanged.connect(self._on_frequency_range_changed)
     
     def _enforce_2mhz_bandwidth(self):
         """Enforce 2MHz bandwidth between f1 and f2."""
@@ -1261,3 +1367,47 @@ class ControlsWidget(QWidget):
         self.decode_status_label.setText("Detect encoding and decode data")
         self.decode_status_label.setStyleSheet("color: #757575;")
         self.detected_encoding_label.setText("")
+        
+        # Re-enable buttons
+        self.demod_button.setEnabled(True)
+        self.decode_button.setEnabled(True)
+    
+    def update_frequency_display(self, frequency: float):
+        """Update frequency display when device frequency changes."""
+        try:
+            # Temporarily disconnect signal to avoid loops
+            if hasattr(self, 'frequency_input'):
+                self.frequency_input.textChanged.disconnect()  # Use textChanged for QLineEdit
+                self.frequency_input.setText(f"{frequency / 1e6:.3f}")  # Use setText for QLineEdit
+                self.frequency_input.textChanged.connect(self._on_frequency_typing)
+                
+        except Exception as e:
+            print(f"Error updating frequency display: {e}")
+    
+    def update_bandwidth_display(self, bandwidth: float):
+        """Update bandwidth display when device bandwidth changes."""
+        try:
+            # Update bandwidth combo box to reflect current setting
+            if hasattr(self, 'bandwidth_combo'):
+                # Find matching value in combo box
+                bandwidth_mhz = bandwidth / 1e6
+                combo_index = -1
+                for i in range(self.bandwidth_combo.count()):
+                    combo_text = self.bandwidth_combo.itemText(i)
+                    if str(bandwidth_mhz) in combo_text:
+                        combo_index = i
+                        break
+                
+                if combo_index >= 0:
+                    # Temporarily disconnect signal to avoid loops
+                    self.bandwidth_combo.currentTextChanged.disconnect()
+                    self.bandwidth_combo.setCurrentIndex(combo_index)
+                    self.bandwidth_combo.currentTextChanged.connect(self._on_bandwidth_changed)
+                
+        except Exception as e:
+            print(f"Error updating bandwidth display: {e}")
+    
+    def _reset_status_label(self):
+        """Reset status label to default."""
+        self.status_label.setText("Ready")
+        self.status_label.setStyleSheet("QLabel { font-weight: bold; color: green; }")

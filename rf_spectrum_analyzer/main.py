@@ -50,9 +50,8 @@ def setup_application():
     try:
         QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    except AttributeError:
-        # These attributes might not exist in newer Qt versions
-        pass
+    except Exception as e:
+        print(e)
     
     app = QApplication(sys.argv)
     app.setApplicationName("RF Spectrum Analyzer")

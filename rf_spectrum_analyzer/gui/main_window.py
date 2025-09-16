@@ -18,6 +18,7 @@ import pyqtgraph as pg
 
 from rf_spectrum_analyzer.gui.spectrum_widget import SpectrumWidget
 from rf_spectrum_analyzer.gui.waterfall_widget import WaterfallWidget
+from rf_spectrum_analyzer.utils.logger import get_logger
 from rf_spectrum_analyzer.gui.controls_widget import ControlsWidget
 from rf_spectrum_analyzer.gui.constellation_widget import ConstellationWidget
 from rf_spectrum_analyzer.gui.bitstream_widget import BitstreamWidget
@@ -36,6 +37,7 @@ class MainWindow(QMainWindow):
     device_changed = Signal(str)
     frequency_changed = Signal(float)
     sample_rate_changed = Signal(float)
+    bandwidth_changed = Signal(float)  # New signal for bandwidth
     gain_changed = Signal(float)
     fft_size_changed = Signal(int)
     window_changed = Signal(str)
@@ -64,6 +66,9 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.app = app  # Reference to main application
         self.acquisition_active = False
+        
+        # Initialize logger
+        self.logger = get_logger(__name__)
         
         # Performance monitoring
         self.fps_timer = QTimer()
@@ -327,6 +332,7 @@ class MainWindow(QMainWindow):
         self.controls_widget.device_changed.connect(self.device_changed.emit)
         self.controls_widget.frequency_changed.connect(self.frequency_changed.emit)
         self.controls_widget.sample_rate_changed.connect(self.sample_rate_changed.emit)
+        self.controls_widget.bandwidth_changed.connect(self.bandwidth_changed.emit)
         self.controls_widget.gain_changed.connect(self.gain_changed.emit)
         self.controls_widget.fft_size_changed.connect(self.fft_size_changed.emit)
         self.controls_widget.window_changed.connect(self.window_changed.emit)
@@ -591,6 +597,22 @@ class MainWindow(QMainWindow):
         status = device_info.get("status", "Unknown")
         connected = status.lower() in ["connected", "active", "running"]
         self.controls_widget.update_device_status(device_type, connected)
+    
+    def update_device_frequency(self, frequency: float):
+        """Update frequency display when device frequency changes."""
+        try:
+            self.controls_widget.update_frequency_display(frequency)
+            self.logger.debug(f"GUI updated with new frequency: {frequency/1e6:.3f} MHz")
+        except Exception as e:
+            self.logger.error(f"Error updating frequency display: {e}")
+    
+    def update_device_bandwidth(self, bandwidth: float):
+        """Update bandwidth display when device bandwidth changes."""
+        try:
+            self.controls_widget.update_bandwidth_display(bandwidth)
+            self.logger.debug(f"GUI updated with new bandwidth: {bandwidth/1e6:.3f} MHz")
+        except Exception as e:
+            self.logger.error(f"Error updating bandwidth display: {e}")
     
     def get_current_settings(self) -> Dict[str, Any]:
         """Get current GUI settings."""

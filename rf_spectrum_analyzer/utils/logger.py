@@ -1,5 +1,27 @@
 """
-Logging configuration for RF Spectrum Analyzer
+Logging configuration    def format(self, record):
+        # Simple formatting to avoid recursion
+        try:
+            # Add colors to levelname
+            if record.levelname in self.COLORS:
+                levelname_with_color = (
+                    f"{self.COLORS[record.levelname]}"
+                    f"{record.levelname}"
+                    f"{self.COLORS['RESET']}"
+                )
+                # Create new record to avoid modifying original
+                import logging
+                new_record = logging.LogRecord(
+                    record.name, record.levelno, record.pathname, record.lineno,
+                    record.msg, record.args, record.exc_info, record.funcName
+                )
+                new_record.levelname = levelname_with_color
+                return super().format(new_record)
+            else:
+                return super().format(record)
+        except:
+            # Fallback to simple format
+            return f"{record.levelname}: {record.getMessage()}"ectrum Analyzer
 Provides centralized logging setup with configurable levels and output formats
 """
 

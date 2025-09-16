@@ -136,11 +136,16 @@ class RFSpectrumAnalyzerApp(QObject):
             self.setup_timers()
             
             # Initialize acquisition thread
-            self.acquisition_thread = DataAcquisitionThread(
-                self.sdr_manager, self.settings
-            )
-            self.acquisition_thread.data_ready.connect(self.on_new_data)
-            self.acquisition_thread.error_occurred.connect(self.on_acquisition_error)
+            try:
+                self.acquisition_thread = DataAcquisitionThread(
+                    self.sdr_manager, self.settings
+                )
+                self.acquisition_thread.data_ready.connect(self.on_new_data)
+                self.acquisition_thread.error_occurred.connect(self.on_acquisition_error)
+                self.logger.info("Data acquisition thread initialized successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize acquisition thread: {e}")
+                self.acquisition_thread = None
             
             # Setup demo mode if enabled
             if self.demo_mode:
@@ -169,6 +174,9 @@ class RFSpectrumAnalyzerApp(QObject):
                 # Only disable demo mode if it wasn't explicitly requested
                 if not demo_requested:
                     self.demo_mode = False
+                # Auto-start acquisition for real SDR devices
+                self.logger.info("Auto-starting data acquisition...")
+                self.start_acquisition()
             else:
                 self.logger.warning(f"Failed to connect to {device_type}, enabling demo mode")
                 self._enable_demo_mode()
@@ -211,6 +219,7 @@ class RFSpectrumAnalyzerApp(QObject):
             self.main_window.device_changed.connect(self.change_device)
             self.main_window.frequency_changed.connect(self.change_frequency)
             self.main_window.sample_rate_changed.connect(self.change_sample_rate)
+            self.main_window.bandwidth_changed.connect(self.change_bandwidth)
             self.main_window.gain_changed.connect(self.change_gain)
             
             # Connect processing signals
@@ -272,6 +281,10 @@ class RFSpectrumAnalyzerApp(QObject):
                 return False
             
             # Start acquisition thread
+            if self.acquisition_thread is None:
+                self.logger.error("Acquisition thread not initialized")
+                return False
+            
             self.acquisition_thread.start()
             
             # Update UI state
@@ -331,19 +344,15 @@ class RFSpectrumAnalyzerApp(QObject):
             fft_size = self.settings.dsp.fft_size
             samples = self.iq_buffer[:fft_size]
             
-            self.logger.debug(f"Processing IQ data: {len(samples)} samples")
-            
             # Update signal processor with current data for detection
             self.signal_processor.update_current_data(samples)
             
-            # Compute spectrum
+            # Compute spectrum with adaptive throttling
             spectrum = self.signal_processor.compute_spectrum(samples)
             if spectrum is not None:
                 self.spectrum_data = spectrum
-                self.logger.debug(f"Spectrum computed: {len(spectrum)} points")
-            
-            # Update waterfall data
-            if len(spectrum) > 0:
+                
+                # Update waterfall data only when we have new spectrum
                 self.waterfall_data.append(spectrum.copy())
                 max_waterfall_lines = self.settings.gui.waterfall_height
                 if len(self.waterfall_data) > max_waterfall_lines:
@@ -351,7 +360,8 @@ class RFSpectrumAnalyzerApp(QObject):
             
             # Process constellation data (run every few frames for performance)
             self.logger.debug(f"Frame count: {self.frame_count}, modulo: {self.frame_count % 3}")
-            if self.frame_count % 1 == 0:  # Every frame for testing
+            # TEMPORARILY DISABLED: Advanced analysis causes GUI freeze
+            if False and self.frame_count % 10 == 0:  # Disabled to prevent GUI freeze
                 self.logger.debug("Triggering advanced analysis...")
                 try:
                     self.process_advanced_analysis(samples)
@@ -602,10 +612,7 @@ class RFSpectrumAnalyzerApp(QObject):
     def update_spectrum_display(self):
         """Update spectrum display in GUI."""
         if self.main_window and len(self.spectrum_data) > 0:
-            self.logger.debug(f"Updating spectrum display with {len(self.spectrum_data)} points")
             self.main_window.update_spectrum(self.spectrum_data)
-        else:
-            self.logger.debug(f"No spectrum update: main_window={self.main_window is not None}, spectrum_data_len={len(self.spectrum_data)}")
     
     def update_waterfall_display(self):
         """Update waterfall display in GUI."""
@@ -661,14 +668,39 @@ class RFSpectrumAnalyzerApp(QObject):
             self.logger.error(f"Error changing device: {e}")
     
     def change_frequency(self, frequency: float):
-        """Change center frequency."""
+        """Change center frequency in real-time without stopping acquisition."""
         try:
-            self.logger.info(f"Changing frequency to: {frequency} Hz")
+            self.logger.info(f"Real-time frequency change to: {frequency/1e6:.3f} MHz")
+            
+            # Update settings first
+            old_frequency = self.settings.sdr.center_frequency
             self.settings.sdr.center_frequency = frequency
+            
+            # If SDR is connected, apply change immediately
             if self.sdr_manager and self.sdr_manager.is_connected():
-                self.sdr_manager.set_center_frequency(frequency)
+                success = self.sdr_manager.set_frequency(frequency)
+                if success:
+                    self.logger.info(f"Frequency successfully changed from {old_frequency/1e6:.3f} MHz to {frequency/1e6:.3f} MHz")
+                    
+                    # Update signal processor with new frequency if needed
+                    if hasattr(self.signal_processor, 'set_center_frequency'):
+                        self.signal_processor.set_center_frequency(frequency)
+                    
+                    # Notify GUI of successful change
+                    if hasattr(self, 'main_window') and self.main_window:
+                        self.main_window.update_device_frequency(frequency)
+                else:
+                    self.logger.error("Failed to set frequency on device")
+                    # Revert settings change
+                    self.settings.sdr.center_frequency = old_frequency
+            else:
+                self.logger.warning("SDR not connected - frequency change saved for next connection")
+                
         except Exception as e:
             self.logger.error(f"Error changing frequency: {e}")
+            # Revert settings on error
+            if 'old_frequency' in locals():
+                self.settings.sdr.center_frequency = old_frequency
     
     def change_sample_rate(self, sample_rate: float):
         """Change sample rate."""
@@ -684,6 +716,49 @@ class RFSpectrumAnalyzerApp(QObject):
                 
         except Exception as e:
             self.logger.error(f"Error changing sample rate: {e}")
+    
+    def change_bandwidth(self, bandwidth: float):
+        """Change bandwidth in real-time without stopping acquisition."""
+        try:
+            self.logger.info(f"Real-time bandwidth change to: {bandwidth/1e6:.3f} MHz")
+            
+            # Update settings first
+            old_bandwidth = self.settings.sdr.bandwidth
+            self.settings.sdr.bandwidth = bandwidth
+            
+            # If SDR is connected, apply change immediately
+            if self.sdr_manager and self.sdr_manager.is_connected():
+                # Check if backend supports bandwidth setting
+                if hasattr(self.sdr_manager, 'set_bandwidth'):
+                    success = self.sdr_manager.set_bandwidth(bandwidth)
+                    if success:
+                        self.logger.info(f"Bandwidth successfully changed from {old_bandwidth/1e6:.3f} MHz to {bandwidth/1e6:.3f} MHz")
+                        
+                        # For SpyServer, bandwidth change may affect sample rate
+                        # Update signal processor if needed
+                        if hasattr(self.signal_processor, 'set_sample_rate') and bandwidth != old_bandwidth:
+                            # Update signal processor with new effective sample rate
+                            self.signal_processor.set_sample_rate(self.settings.sdr.sample_rate)
+                        
+                        # Notify GUI of successful change
+                        if hasattr(self, 'main_window') and self.main_window:
+                            self.main_window.update_device_bandwidth(bandwidth)
+                    else:
+                        self.logger.error("Failed to set bandwidth on device")
+                        # Revert settings change
+                        self.settings.sdr.bandwidth = old_bandwidth
+                else:
+                    self.logger.warning("Backend does not support real-time bandwidth setting")
+                    # For backends without bandwidth support, log but keep setting
+                    self.logger.info("Bandwidth setting saved for future use")
+            else:
+                self.logger.warning("SDR not connected - bandwidth change saved for next connection")
+                
+        except Exception as e:
+            self.logger.error(f"Error changing bandwidth: {e}")
+            # Revert settings on error
+            if 'old_bandwidth' in locals():
+                self.settings.sdr.bandwidth = old_bandwidth
     
     def change_gain(self, gain: float):
         """Change RF gain."""
@@ -977,8 +1052,6 @@ class RFSpectrumAnalyzerApp(QObject):
     def change_frequency_range(self, f1: float, f2: float):
         """Change frequency range for analysis."""
         try:
-            self.logger.info(f"Frequency range changed: {f1/1e6:.3f} MHz - {f2/1e6:.3f} MHz")
-            
             # Store frequency range for analysis
             self.analysis_f1 = f1
             self.analysis_f2 = f2
@@ -988,7 +1061,7 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.main_window.set_frequency_range(f1, f2)
                 
         except Exception as e:
-            self.logger.error(f"Error changing frequency range: {e}")
+            print(f"Error changing frequency range: {e}")  # Use print instead of logger
     
     def toggle_center_frequency_lock(self, locked: bool):
         """Toggle center frequency lock."""
@@ -1062,3 +1135,19 @@ class RFSpectrumAnalyzerApp(QObject):
         except Exception as e:
             self.logger.error(f"Error getting frequency range data: {e}")
             return None
+    
+    def set_performance_mode(self, mode: str):
+        """Set spectrum processing performance mode.
+        
+        Args:
+            mode: 'fast', 'balanced', or 'quality'
+        """
+        if self.signal_processor:
+            self.signal_processor.set_performance_mode(mode)
+            self.logger.info(f"Performance mode set to: {mode}")
+    
+    def get_performance_stats(self) -> dict:
+        """Get current performance statistics."""
+        if self.signal_processor:
+            return self.signal_processor.get_performance_stats()
+        return {}

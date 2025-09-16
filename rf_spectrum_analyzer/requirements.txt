@@ -34,6 +34,7 @@ pyrtlsdr>=0.2.0
 # SoapySDR  # System package, install via package manager
 
 # Optional Performance Libraries
+pyfftw>=0.12.0  # Fast FFT computation for spectrum analysis
 numba>=0.56.0  # JIT compilation for performance
 psutil>=5.8.0  # System resource monitoring
 
