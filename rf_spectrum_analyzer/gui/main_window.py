@@ -41,6 +41,14 @@ class MainWindow(QMainWindow):
     window_changed = Signal(str)
     averaging_changed = Signal(int)
     
+    # Detection signals
+    manual_detection_triggered = Signal()
+    tdma_detection_triggered = Signal()
+    auto_detection_toggled = Signal(bool)
+    advanced_analysis_toggled = Signal(bool)
+    detection_threshold_changed = Signal(float)
+    detection_interval_changed = Signal(int)
+    
     def __init__(self, settings: Settings, app=None, parent=None):
         super().__init__(parent)
         self.settings = settings
@@ -314,6 +322,14 @@ class MainWindow(QMainWindow):
         self.controls_widget.window_changed.connect(self.window_changed.emit)
         self.controls_widget.averaging_changed.connect(self.averaging_changed.emit)
         
+        # Connect detection signals
+        self.controls_widget.manual_detection_triggered.connect(self.manual_detection_triggered.emit)
+        self.controls_widget.tdma_detection_triggered.connect(self.tdma_detection_triggered.emit)
+        self.controls_widget.auto_detection_toggled.connect(self.auto_detection_toggled.emit)
+        self.controls_widget.advanced_analysis_toggled.connect(self.advanced_analysis_toggled.emit)
+        self.controls_widget.detection_threshold_changed.connect(self.detection_threshold_changed.emit)
+        self.controls_widget.detection_interval_changed.connect(self.detection_interval_changed.emit)
+        
         # Connect spectrum widget signals
         self.spectrum_widget.frequency_clicked.connect(self._on_frequency_clicked)
         
@@ -562,6 +578,11 @@ class MainWindow(QMainWindow):
                 bits = bit_data
             
             self.bitstream_widget.add_bits(bits)
+    
+    def update_detection_status(self, detected, snr_db=None, confidence=None):
+        """Update detection status in controls widget."""
+        if hasattr(self, 'controls_widget') and self.controls_widget:
+            self.controls_widget.update_detection_status(detected, snr_db, confidence)
     
     def set_acquisition_state(self, active: bool):
         """Update acquisition state across all widgets."""

@@ -38,6 +38,8 @@ from rf_spectrum_analyzer.config.settings import Settings
 from rf_spectrum_analyzer.dsp.modulation_analysis import create_modulation_analyzer, create_encoding_analyzer
 from rf_spectrum_analyzer.dsp.demodulation_engine import create_demodulation_engine
 from rf_spectrum_analyzer.dsp.decoding_engine import create_decoding_engine
+from rf_spectrum_analyzer.dsp.signal_detection import create_signal_detector
+from rf_spectrum_analyzer.dsp.tdma_detector import TDMABurstDetector
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +102,22 @@ class SignalProcessor:
         self.demodulation_engine = create_demodulation_engine(settings.sdr.sample_rate)
         self.decoding_engine = create_decoding_engine()
         
+        # Signal detection components
+        self.signal_detector = create_signal_detector(settings.sdr.sample_rate)
+        self.tdma_detector = TDMABurstDetector(settings.sdr.sample_rate)
+        
         # Analysis results cache
         self.last_modulation_analysis = None
         self.last_encoding_analysis = None
+        self.last_detection_result = None
+        self.last_tdma_analysis = None
+        
+        # Detection state variables
+        self._current_iq_data = None
+        self._auto_detection_enabled = False
+        self._advanced_analysis_enabled = False
+        self._detection_threshold_dbm = -80.0
+        self._detection_interval_ms = 100
         
         self.logger.info("Signal processor initialized")
     
@@ -645,104 +660,170 @@ class SignalProcessor:
             self.logger.error(f"Decoding error: {e}")
             return {"success": False, "error": str(e)}
     
-    def process_complete_chain(self, iq_samples: np.ndarray) -> Dict[str, Any]:
+    # Configuration methods
+    def set_fft_size(self, fft_size: int):
+        """Update FFT size."""
+        self.fft_size = fft_size
+        self.window = self._create_window(self.window_type, self.fft_size)
+        self._setup_fft()
+        self.spectrum_history.clear()
+    
+    def set_window_function(self, window_type: str):
+        """Update window function."""
+        self.window_type = window_type
+        self.window = self._create_window(window_type, self.fft_size)
+    
+    def set_averaging(self, averaging: int):
+        """Update averaging count."""
+        self.averaging = averaging
+    
+    # Modulation Analysis and Demodulation Methods
+    def analyze_modulation(self, iq_samples: np.ndarray) -> Dict[str, Any]:
         """
-        Complete processing chain: modulation detection -> demodulation -> 
-        encoding detection -> decoding.
+        Analyze modulation type and parameters from IQ samples.
         
         Args:
             iq_samples: Complex IQ signal data
             
         Returns:
-            Dictionary containing all processing results
+            Dictionary containing modulation analysis results
         """
         try:
-            result = {
-                "success": False,
-                "modulation_analysis": {},
-                "demodulation": {},
-                "encoding_analysis": {},
-                "decoding": {},
-                "final_data": np.array([])
-            }
+            if len(iq_samples) < 1024:
+                return {"type": "Unknown", "confidence": 0.0, "parameters": {}}
             
-            # Step 1: Modulation analysis
-            mod_analysis = self.analyze_modulation(iq_samples)
-            result["modulation_analysis"] = mod_analysis
+            # Perform modulation analysis
+            modulation_result = self.modulation_analyzer.detect_modulation(iq_samples)
             
-            if mod_analysis["confidence"] < 0.3:
-                result["error"] = "Low confidence in modulation detection"
-                return result
+            # Cache the result
+            self.last_modulation_analysis = modulation_result
             
-            # Step 2: Demodulation
-            demod_result = self.demodulate_signal(
-                iq_samples, 
-                mod_analysis["type"], 
-                mod_analysis["parameters"]
-            )
-            result["demodulation"] = demod_result
+            self.logger.debug(f"Detected modulation: {modulation_result['type']} "
+                            f"(confidence: {modulation_result['confidence']:.2f})")
             
-            if not demod_result.get("success", False):
-                result["error"] = "Demodulation failed"
-                return result
-            
-            # Step 3: Encoding analysis (if we have digital data)
-            demod_data = demod_result.get("demodulated_data", np.array([]))
-            
-            # Debug logging
-            self.logger.debug(f"Demod data type: {type(demod_data)}, value: {demod_data}")
-            
-            # Ensure demod_data is numpy array
-            if not isinstance(demod_data, np.ndarray):
-                if isinstance(demod_data, (list, tuple)):
-                    demod_data = np.array(demod_data)
-                else:
-                    demod_data = np.array([])
-            
-            if demod_result.get("data_type") == "digital" and len(demod_data) > 0:
-                
-                # Convert to binary if needed - with extra safety
-                try:
-                    if hasattr(demod_data, 'dtype') and demod_data.dtype != bool and demod_data.dtype != int:
-                        binary_data = (demod_data > np.mean(demod_data)).astype(int)
-                    else:
-                        binary_data = demod_data.astype(int)
-                except AttributeError as e:
-                    self.logger.error(f"Dtype access error on {type(demod_data)}: {e}")
-                    binary_data = np.array(demod_data, dtype=int)
-                
-                enc_analysis = self.analyze_encoding(binary_data)
-                result["encoding_analysis"] = enc_analysis
-                
-                # Step 4: Decoding
-                if enc_analysis["type"] != "None" and enc_analysis["confidence"] > 0.3:
-                    decode_result = self.decode_data(
-                        binary_data,
-                        enc_analysis["type"],
-                        enc_analysis["parameters"]
-                    )
-                    result["decoding"] = decode_result
-                    result["final_data"] = decode_result.get("decoded_data", binary_data)
-                else:
-                    result["final_data"] = binary_data
-            else:
-                # For analog data, final data is the demodulated output
-                result["final_data"] = demod_data
-            
-            result["success"] = True
-            return result
+            return modulation_result
             
         except Exception as e:
-            self.logger.error(f"Complete processing chain error: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "modulation_analysis": {},
-                "demodulation": {},
-                "encoding_analysis": {},
-                "decoding": {},
-                "final_data": np.array([])
-            }
+            self.logger.error(f"Modulation analysis error: {e}")
+            return {"type": "Unknown", "confidence": 0.0, "parameters": {}, "error": str(e)}
+    
+    def demodulate_signal(self, iq_samples: np.ndarray, 
+                         modulation_type: str = None, 
+                         parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Demodulate signal based on modulation type.
+        
+        Args:
+            iq_samples: Complex IQ signal data
+            modulation_type: Modulation type (auto-detect if None)
+            parameters: Modulation parameters
+            
+        Returns:
+            Dictionary containing demodulated data and metadata
+        """
+        try:
+            # Auto-detect modulation if not specified
+            if modulation_type is None:
+                if self.last_modulation_analysis is None:
+                    mod_analysis = self.analyze_modulation(iq_samples)
+                else:
+                    mod_analysis = self.last_modulation_analysis
+                
+                modulation_type = mod_analysis["type"]
+                if parameters is None:
+                    parameters = mod_analysis.get("parameters", {})
+            
+            # Fix symbol rate estimation if needed
+            if parameters and "symbol_rate" in parameters:
+                # Override low symbol rate estimates that are clearly wrong
+                if parameters["symbol_rate"] < 10000:  # Less than 10 kHz is probably wrong
+                    # Estimate based on sample rate and expected oversampling
+                    expected_symbol_rate = self.settings.sdr.sample_rate / 20  # 20x oversampling
+                    parameters["symbol_rate"] = expected_symbol_rate
+                    self.logger.debug(f"Overriding symbol rate to {expected_symbol_rate:.0f} Hz")
+            
+            # Demodulate using the appropriate engine
+            demod_result = self.demodulation_engine.demodulate(
+                iq_samples, modulation_type, parameters
+            )
+            
+            self.logger.debug(f"Demodulated {modulation_type} signal, "
+                            f"got {len(demod_result.get('demodulated_data', []))} samples")
+            
+            return demod_result
+            
+        except Exception as e:
+            self.logger.error(f"Demodulation error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def analyze_encoding(self, bit_data: np.ndarray) -> Dict[str, Any]:
+        """
+        Analyze channel coding from bit sequence.
+        
+        Args:
+            bit_data: Binary data sequence
+            
+        Returns:
+            Dictionary containing encoding analysis results
+        """
+        try:
+            if len(bit_data) < 64:
+                return {"type": "None", "confidence": 0.0, "parameters": {}}
+            
+            # Perform encoding analysis
+            encoding_result = self.encoding_analyzer.detect_encoding(bit_data)
+            
+            # Cache the result
+            self.last_encoding_analysis = encoding_result
+            
+            self.logger.debug(f"Detected encoding: {encoding_result['type']} "
+                            f"(confidence: {encoding_result['confidence']:.2f})")
+            
+            return encoding_result
+            
+        except Exception as e:
+            self.logger.error(f"Encoding analysis error: {e}")
+            return {"type": "None", "confidence": 0.0, "parameters": {}, "error": str(e)}
+    
+    def decode_data(self, encoded_data: np.ndarray, 
+                   coding_type: str = None, 
+                   parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Decode channel-coded data.
+        
+        Args:
+            encoded_data: Encoded bit sequence
+            coding_type: Coding type (auto-detect if None)
+            parameters: Coding parameters
+            
+        Returns:
+            Dictionary containing decoded data and metadata
+        """
+        try:
+            # Auto-detect encoding if not specified
+            if coding_type is None:
+                if self.last_encoding_analysis is None:
+                    enc_analysis = self.analyze_encoding(encoded_data)
+                else:
+                    enc_analysis = self.last_encoding_analysis
+                
+                coding_type = enc_analysis["type"]
+                if parameters is None:
+                    parameters = enc_analysis.get("parameters", {})
+            
+            # Decode using the appropriate engine
+            decode_result = self.decoding_engine.decode(
+                encoded_data, coding_type, parameters
+            )
+            
+            self.logger.debug(f"Decoded {coding_type} data, "
+                            f"corrected {decode_result.get('corrected_errors', 0)} errors")
+            
+            return decode_result
+            
+        except Exception as e:
+            self.logger.error(f"Decoding error: {e}")
+            return {"success": False, "error": str(e)}
     
     def process_complete_chain(self, iq_samples: np.ndarray) -> Dict[str, Any]:
         """
@@ -844,7 +925,400 @@ class SignalProcessor:
         try:
             self.modulation_analyzer = create_modulation_analyzer(sample_rate)
             self.demodulation_engine = create_demodulation_engine(sample_rate)
+            self.signal_detector = create_signal_detector(sample_rate)
+            self.tdma_detector = TDMABurstDetector(sample_rate)
             self.logger.info(f"Updated sample rate to {sample_rate} Hz")
         except Exception as e:
             self.logger.error(f"Error updating sample rate: {e}")
         self.spectrum_history.clear()
+    
+    def detect_signal(self, iq_samples: np.ndarray, method: str = "energy", 
+                     p_fa: float = 1e-6) -> Dict[str, Any]:
+        """
+        Perform signal detection using sdr._detection algorithms.
+        
+        Args:
+            iq_samples: Complex IQ samples
+            method: Detection method ("energy", "correlation", "adaptive")
+            p_fa: Probability of false alarm
+            
+        Returns:
+            Detection result dictionary
+        """
+        try:
+            from rf_spectrum_analyzer.dsp.signal_detection import DetectionMethod
+            
+            if len(iq_samples) == 0:
+                return {"success": False, "error": "Empty signal"}
+            
+            # Choose detection method
+            if method == "energy":
+                result = self.signal_detector.energy_detection(iq_samples, p_fa)
+            elif method == "correlation":
+                # Need template for correlation detection
+                templates = list(self.signal_detector.signal_templates.keys())
+                if not templates:
+                    self.logger.warning("No templates available for correlation detection, using energy")
+                    result = self.signal_detector.energy_detection(iq_samples, p_fa)
+                else:
+                    result = self.signal_detector.correlation_detection(iq_samples, templates[0], p_fa)
+            elif method == "adaptive":
+                result = self.signal_detector.adaptive_detection(iq_samples)
+            else:
+                self.logger.warning(f"Unknown detection method {method}, using energy")
+                result = self.signal_detector.energy_detection(iq_samples, p_fa)
+            
+            # Cache result
+            self.last_detection_result = result
+            
+            # Convert to dictionary for easier handling
+            detection_dict = {
+                "success": True,
+                "signal_detected": result.signal_detected,
+                "detection_method": result.detection_method,
+                "confidence": result.confidence,
+                "snr_estimate": result.snr_estimate,
+                "test_statistic": result.test_statistic,
+                "threshold": result.threshold,
+                "p_fa": result.p_fa,
+                "p_d": result.p_d,
+                "noise_variance": result.noise_variance
+            }
+            
+            self.logger.debug(f"Signal detection: {result.signal_detected} "
+                            f"(confidence: {result.confidence:.3f}, SNR: {result.snr_estimate:.1f} dB)")
+            
+            return detection_dict
+            
+        except Exception as e:
+            self.logger.error(f"Signal detection error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def detect_tdma_bursts(self, iq_samples: np.ndarray, 
+                          sync_pattern: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Detect TDMA bursts in signal.
+        
+        Args:
+            iq_samples: Complex IQ samples
+            sync_pattern: Optional sync pattern for correlation detection
+            
+        Returns:
+            TDMA detection result dictionary
+        """
+        try:
+            if len(iq_samples) == 0:
+                return {"success": False, "error": "Empty signal"}
+            
+            # Set sync pattern if provided
+            if sync_pattern is not None:
+                self.tdma_detector.set_sync_pattern(sync_pattern)
+            
+            # Detect bursts
+            bursts = self.tdma_detector.detect_bursts(iq_samples)
+            
+            # Analyze timing if bursts found
+            timing_analysis = None
+            if bursts:
+                timing_analysis = self.tdma_detector.analyze_timing(bursts)
+            
+            # Cache result
+            self.last_tdma_analysis = {
+                "bursts": bursts,
+                "timing_analysis": timing_analysis
+            }
+            
+            result = {
+                "success": True,
+                "burst_count": len(bursts),
+                "bursts_detected": len(bursts) > 0,
+                "bursts": bursts,
+                "timing_analysis": timing_analysis
+            }
+            
+            self.logger.debug(f"TDMA detection: {len(bursts)} bursts found")
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"TDMA burst detection error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def spectrum_sensing(self, iq_samples: np.ndarray, 
+                        frequency_bands: Dict[str, Tuple[float, float]]) -> Dict[str, Any]:
+        """
+        Perform spectrum sensing across multiple frequency bands.
+        
+        Args:
+            iq_samples: Complex IQ samples
+            frequency_bands: Dictionary of {band_name: (start_freq, stop_freq)}
+            
+        Returns:
+            Spectrum sensing results
+        """
+        try:
+            if len(iq_samples) == 0:
+                return {"success": False, "error": "Empty signal"}
+            
+            # Perform spectrum sensing
+            sensing_results = self.signal_detector.spectrum_sensing(iq_samples, frequency_bands)
+            
+            # Convert results to serializable format
+            results_dict = {}
+            for band_name, result in sensing_results.items():
+                results_dict[band_name] = {
+                    "frequency_band": result.frequency_band,
+                    "center_frequency": result.center_frequency,
+                    "bandwidth": result.bandwidth,
+                    "signal_detected": result.signal_detected,
+                    "occupancy_probability": result.occupancy_probability,
+                    "signal_power": result.signal_power,
+                    "noise_power": result.noise_power,
+                    "snr_db": result.snr_db,
+                    "detection_confidence": result.detection_confidence
+                }
+            
+            return {
+                "success": True,
+                "band_results": results_dict,
+                "total_bands": len(frequency_bands),
+                "occupied_bands": sum(1 for r in sensing_results.values() if r.signal_detected)
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Spectrum sensing error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def calibrate_detector(self, noise_samples: np.ndarray, method: str = "robust") -> Dict[str, Any]:
+        """
+        Calibrate signal detector with noise samples.
+        
+        Args:
+            noise_samples: Pure noise samples for calibration
+            method: Calibration method ("robust", "simple", "adaptive")
+            
+        Returns:
+            Calibration result
+        """
+        try:
+            if len(noise_samples) == 0:
+                return {"success": False, "error": "Empty noise samples"}
+            
+            noise_variance = self.signal_detector.calibrate_noise_floor(noise_samples, method)
+            
+            return {
+                "success": True,
+                "noise_variance": noise_variance,
+                "method": method,
+                "calibrated": self.signal_detector.calibrated
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Detector calibration error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def add_signal_template(self, name: str, template: np.ndarray):
+        """
+        Add signal template for correlation detection.
+        
+        Args:
+            name: Template name
+            template: Signal template (complex samples)
+        """
+        try:
+            self.signal_detector.add_signal_template(name, template)
+            self.logger.info(f"Added signal template '{name}'")
+        except Exception as e:
+            self.logger.error(f"Error adding signal template: {e}")
+    
+    def get_detection_statistics(self) -> Dict[str, Any]:
+        """Get signal detection performance statistics."""
+        try:
+            return self.signal_detector.get_detection_statistics()
+        except Exception as e:
+            self.logger.error(f"Error getting detection statistics: {e}")
+            return {"error": str(e)}
+    
+    # Detection control methods for GUI integration
+    def detect_signals_manual(self) -> Optional[Dict[str, Any]]:
+        """
+        Manually trigger signal detection on current data buffer.
+        
+        Returns:
+            Detection results or None if no data available
+        """
+        try:
+            # Check if we have recent signal data
+            if not hasattr(self, '_current_iq_data') or self._current_iq_data is None:
+                self.logger.warning("No signal data available for manual detection")
+                return None
+            
+            # Perform energy detection
+            result = self.detect_signal(self._current_iq_data, method="energy")
+            
+            if result.get("success", False):
+                return {
+                    "detected": result.get("signal_detected", False),
+                    "snr_db": result.get("snr_estimate", 0.0),
+                    "confidence": result.get("confidence", 0.0),
+                    "method": "manual_energy",
+                    "timestamp": "manual_trigger"
+                }
+            else:
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Manual detection error: {e}")
+            return None
+    
+    def detect_tdma_bursts(self, iq_samples: Optional[np.ndarray] = None) -> Optional[Dict[str, Any]]:
+        """
+        Detect TDMA bursts in signal data.
+        
+        Args:
+            iq_samples: Optional IQ samples (uses current data if None)
+            
+        Returns:
+            TDMA detection results or None if no data available
+        """
+        try:
+            # Use provided samples or current data buffer
+            if iq_samples is None:
+                if not hasattr(self, '_current_iq_data') or self._current_iq_data is None:
+                    self.logger.warning("No signal data available for TDMA detection")
+                    return None
+                iq_samples = self._current_iq_data
+            
+            # Perform TDMA burst detection using the tdma_detector
+            result = self.tdma_detector.detect_bursts(iq_samples)
+            
+            if result:
+                # Analyze timing if bursts found
+                timing_analysis = None
+                if result:
+                    timing_analysis = self.tdma_detector.analyze_timing(result)
+                
+                return {
+                    "detected": len(result) > 0,
+                    "burst_count": len(result),
+                    "bursts": result,
+                    "timing_analysis": timing_analysis,
+                    "method": "tdma_burst",
+                    "timestamp": "manual_trigger"
+                }
+            else:
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"TDMA detection error: {e}")
+            return None
+    
+    def set_auto_detection(self, enabled: bool):
+        """
+        Enable or disable automatic signal detection.
+        
+        Args:
+            enabled: True to enable auto detection, False to disable
+        """
+        try:
+            self._auto_detection_enabled = enabled
+            self.logger.info(f"Auto detection {'enabled' if enabled else 'disabled'}")
+            
+            # Update settings if available
+            if hasattr(self.settings, 'detection'):
+                self.settings.detection.auto_detection_enabled = enabled
+                
+        except Exception as e:
+            self.logger.error(f"Error setting auto detection: {e}")
+    
+    def set_advanced_analysis(self, enabled: bool):
+        """
+        Enable or disable advanced analysis mode.
+        
+        Args:
+            enabled: True to enable advanced analysis, False to disable
+        """
+        try:
+            self._advanced_analysis_enabled = enabled
+            self.logger.info(f"Advanced analysis {'enabled' if enabled else 'disabled'}")
+            
+            # Update settings if available
+            if hasattr(self.settings, 'detection'):
+                self.settings.detection.advanced_analysis_enabled = enabled
+                
+        except Exception as e:
+            self.logger.error(f"Error setting advanced analysis: {e}")
+    
+    def set_detection_threshold(self, threshold_dbm: float):
+        """
+        Set signal detection threshold.
+        
+        Args:
+            threshold_dbm: Detection threshold in dBm
+        """
+        try:
+            self._detection_threshold_dbm = threshold_dbm
+            self.logger.info(f"Detection threshold set to {threshold_dbm} dBm")
+            
+            # Update settings if available
+            if hasattr(self.settings, 'detection'):
+                self.settings.detection.energy_threshold_dbm = threshold_dbm
+                
+        except Exception as e:
+            self.logger.error(f"Error setting detection threshold: {e}")
+    
+    def set_detection_interval(self, interval_ms: int):
+        """
+        Set periodic detection interval.
+        
+        Args:
+            interval_ms: Detection interval in milliseconds
+        """
+        try:
+            self._detection_interval_ms = interval_ms
+            self.logger.info(f"Detection interval set to {interval_ms} ms")
+            
+            # Update settings if available
+            if hasattr(self.settings, 'detection'):
+                self.settings.detection.detection_interval_ms = interval_ms
+                
+        except Exception as e:
+            self.logger.error(f"Error setting detection interval: {e}")
+    
+    def update_current_data(self, iq_samples: np.ndarray):
+        """
+        Update current IQ data buffer for detection operations.
+        
+        Args:
+            iq_samples: New IQ samples to store
+        """
+        try:
+            self._current_iq_data = iq_samples.copy() if iq_samples is not None else None
+            
+            # Perform auto detection if enabled
+            if hasattr(self, '_auto_detection_enabled') and self._auto_detection_enabled:
+                self._perform_auto_detection()
+                
+        except Exception as e:
+            self.logger.error(f"Error updating current data: {e}")
+    
+    def _perform_auto_detection(self):
+        """Perform automatic detection on current data."""
+        try:
+            if self._current_iq_data is None:
+                return
+            
+            # Check signal power against threshold
+            signal_power = np.mean(np.abs(self._current_iq_data)**2)
+            power_dbm = 10 * np.log10(signal_power + 1e-12)
+            
+            threshold = getattr(self, '_detection_threshold_dbm', -80.0)
+            
+            if power_dbm > threshold:
+                # Trigger detection
+                result = self.detect_signal(self._current_iq_data, method="energy")
+                if result.get("signal_detected", False):
+                    self.logger.debug(f"Auto detection triggered: {power_dbm:.1f} dBm > {threshold} dBm")
+                    
+        except Exception as e:
+            self.logger.debug(f"Auto detection error: {e}")

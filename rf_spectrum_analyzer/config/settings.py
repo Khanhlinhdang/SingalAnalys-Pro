@@ -69,6 +69,40 @@ class DSPSettings:
 
 
 @dataclass
+class DetectionSettings:
+    """Signal detection configuration using sdr._detection module."""
+    # Auto-trigger settings
+    auto_detection_enabled: bool = True
+    energy_threshold_dbm: float = -80.0  # dBm - Auto trigger level
+    detection_interval_ms: int = 100     # ms - Periodic detection interval
+    
+    # Detection algorithms
+    pfa_target: float = 1e-6             # Probability of false alarm
+    energy_detection_enabled: bool = True
+    correlation_detection_enabled: bool = True
+    adaptive_detection_enabled: bool = True
+    
+    # TDMA detection
+    tdma_detection_enabled: bool = False
+    burst_detection_enabled: bool = False
+    sync_pattern_detection: bool = True
+    
+    # Processing modes
+    detection_mode: str = "adaptive"      # adaptive/continuous/manual/hybrid
+    processing_priority: str = "detection" # detection/analysis/both
+    
+    # Advanced features
+    advanced_analysis_mode: bool = False
+    spectrum_sensing_enabled: bool = True
+    cognitive_radio_mode: bool = False
+    
+    # Performance settings
+    max_detection_samples: int = 100000   # Maximum samples for detection
+    noise_calibration_samples: int = 10000 # Samples for noise floor calibration
+    detection_history_length: int = 1000  # Number of detection results to keep
+
+
+@dataclass
 class GUISettings:
     """GUI configuration settings."""
     window_width: int = 1200
@@ -151,6 +185,7 @@ class Settings:
         self.gui = GUISettings()
         self.processing = ProcessingSettings()
         self.network = NetworkSettings()
+        self.detection = DetectionSettings()
         
         # Configuration file paths
         self.config_dir = Path.home() / ".rf_spectrum_analyzer"
@@ -170,7 +205,8 @@ class Settings:
             "dsp": asdict(self.dsp),
             "gui": asdict(self.gui),
             "processing": asdict(self.processing),
-            "network": asdict(self.network)
+            "network": asdict(self.network),
+            "detection": asdict(self.detection)
         }
     
     def from_dict(self, data: Dict[str, Any]) -> None:
@@ -183,6 +219,10 @@ class Settings:
             self.gui = GUISettings(**data["gui"])
         if "processing" in data:
             self.processing = ProcessingSettings(**data["processing"])
+        if "network" in data:
+            self.network = NetworkSettings(**data["network"])
+        if "detection" in data:
+            self.detection = DetectionSettings(**data["detection"])
         if "network" in data:
             self.network = NetworkSettings(**data["network"])
     

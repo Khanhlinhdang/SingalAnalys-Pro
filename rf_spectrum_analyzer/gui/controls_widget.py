@@ -58,6 +58,14 @@ class ControlsWidget(QWidget):
     auto_detect_modulation_toggled = Signal(bool)
     auto_detect_coding_toggled = Signal(bool)
     
+    # New signals for detection features
+    manual_detection_triggered = Signal()
+    tdma_detection_triggered = Signal()
+    auto_detection_toggled = Signal(bool)
+    advanced_analysis_toggled = Signal(bool)
+    detection_threshold_changed = Signal(float)
+    detection_interval_changed = Signal(int)
+    
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.settings = settings
@@ -88,6 +96,7 @@ class ControlsWidget(QWidget):
         # Create control tabs
         self.create_device_tab()
         self.create_processing_tab()
+        self.create_detection_tab()
         self.create_display_tab()
         
         # Add stretch to push everything to top
@@ -326,6 +335,102 @@ class ControlsWidget(QWidget):
 
         self.tab_widget.addTab(processing_widget, "Processing")
     
+    def create_detection_tab(self):
+        """Create signal detection tab using sdr._detection module."""
+        detection_widget = QWidget()
+        layout = QVBoxLayout(detection_widget)
+        
+        # Auto Detection group
+        auto_group = QGroupBox("Automatic Detection")
+        auto_layout = QFormLayout(auto_group)
+        
+        # Auto detection enable
+        self.auto_detection_checkbox = QCheckBox("Enable Auto Detection")
+        self.auto_detection_checkbox.setToolTip("Automatically detect signals when power > threshold")
+        self.auto_detection_checkbox.toggled.connect(self._on_auto_detection_toggled)
+        auto_layout.addRow("", self.auto_detection_checkbox)
+        
+        # Energy threshold
+        self.energy_threshold_spinbox = QDoubleSpinBox()
+        self.energy_threshold_spinbox.setRange(-120.0, 0.0)
+        self.energy_threshold_spinbox.setSuffix(" dBm")
+        self.energy_threshold_spinbox.setSingleStep(1.0)
+        self.energy_threshold_spinbox.setToolTip("Signal power threshold for auto detection")
+        self.energy_threshold_spinbox.valueChanged.connect(self._on_detection_threshold_changed)
+        auto_layout.addRow("Power Threshold:", self.energy_threshold_spinbox)
+        
+        # Detection interval
+        self.detection_interval_spinbox = QSpinBox()
+        self.detection_interval_spinbox.setRange(10, 10000)
+        self.detection_interval_spinbox.setSuffix(" ms")
+        self.detection_interval_spinbox.setSingleStep(10)
+        self.detection_interval_spinbox.setToolTip("Periodic detection interval")
+        self.detection_interval_spinbox.valueChanged.connect(self._on_detection_interval_changed)
+        auto_layout.addRow("Check Interval:", self.detection_interval_spinbox)
+        
+        layout.addWidget(auto_group)
+        
+        # Manual Detection group
+        manual_group = QGroupBox("Manual Detection")
+        manual_layout = QVBoxLayout(manual_group)
+        
+        # Manual detection button
+        self.manual_detect_button = QPushButton("🔍 Detect Signals")
+        self.manual_detect_button.setToolTip("Manually trigger signal detection")
+        self.manual_detect_button.clicked.connect(self._on_manual_detection_triggered)
+        manual_layout.addWidget(self.manual_detect_button)
+        
+        # TDMA detection button
+        self.tdma_detect_button = QPushButton("📡 TDMA Analysis")
+        self.tdma_detect_button.setToolTip("Detect and analyze TDMA bursts")
+        self.tdma_detect_button.clicked.connect(self._on_tdma_detection_triggered)
+        manual_layout.addWidget(self.tdma_detect_button)
+        
+        layout.addWidget(manual_group)
+        
+        # Advanced Detection group
+        advanced_group = QGroupBox("Advanced Features")
+        advanced_layout = QFormLayout(advanced_group)
+        
+        # Advanced analysis mode
+        self.advanced_analysis_checkbox = QCheckBox("Advanced Analysis Mode")
+        self.advanced_analysis_checkbox.setToolTip("Enable advanced signal analysis features")
+        self.advanced_analysis_checkbox.toggled.connect(self._on_advanced_analysis_toggled)
+        advanced_layout.addRow("", self.advanced_analysis_checkbox)
+        
+        # Spectrum sensing
+        self.spectrum_sensing_checkbox = QCheckBox("Spectrum Sensing")
+        self.spectrum_sensing_checkbox.setToolTip("Enable multi-band spectrum sensing")
+        advanced_layout.addRow("", self.spectrum_sensing_checkbox)
+        
+        # Cognitive radio mode
+        self.cognitive_radio_checkbox = QCheckBox("Cognitive Radio Mode")
+        self.cognitive_radio_checkbox.setToolTip("Enable cognitive radio capabilities")
+        advanced_layout.addRow("", self.cognitive_radio_checkbox)
+        
+        layout.addWidget(advanced_group)
+        
+        # Detection Status group
+        status_group = QGroupBox("Detection Status")
+        status_layout = QFormLayout(status_group)
+        
+        # Detection status indicators
+        self.detection_status_label = QLabel("🔴 No Signal")
+        self.detection_status_label.setStyleSheet("color: red; font-weight: bold;")
+        status_layout.addRow("Status:", self.detection_status_label)
+        
+        # SNR display
+        self.snr_label = QLabel("-- dB")
+        status_layout.addRow("SNR:", self.snr_label)
+        
+        # Confidence display
+        self.confidence_label = QLabel("--.-%")
+        status_layout.addRow("Confidence:", self.confidence_label)
+        
+        layout.addWidget(status_group)
+        
+        self.tab_widget.addTab(detection_widget, "Detection")
+    
     def create_display_tab(self):
         """Create display settings tab."""
         display_widget = QWidget()
@@ -440,6 +545,17 @@ class ControlsWidget(QWidget):
         self.update_fps(0)
         self.update_device_status(self.settings.sdr.device_type, False)
         self.update_frequency_display(self.settings.sdr.center_frequency)
+        
+        # Load detection settings if available
+        if hasattr(self.settings, 'detection'):
+            self.auto_detection_checkbox.setChecked(self.settings.detection.auto_detection_enabled)
+            self.energy_threshold_spinbox.setValue(self.settings.detection.energy_threshold_dbm)
+            self.detection_interval_spinbox.setValue(self.settings.detection.detection_interval_ms)
+        else:
+            # Set default values
+            self.auto_detection_checkbox.setChecked(False)
+            self.energy_threshold_spinbox.setValue(-80.0)
+            self.detection_interval_spinbox.setValue(100)
     
     def set_acquisition_state(self, active: bool):
         """Update controls based on acquisition state."""
@@ -551,6 +667,55 @@ class ControlsWidget(QWidget):
         """Handle demodulation enable toggle."""
         self.demodulation_toggled.emit(checked)
         self.settings.dsp.demodulation_enabled = checked
+    
+    def _on_auto_detection_toggled(self, enabled):
+        """Handle auto detection toggle."""
+        self.auto_detection_toggled.emit(enabled)
+        if hasattr(self.settings, 'detection'):
+            self.settings.detection.auto_detection_enabled = enabled
+    
+    def _on_detection_threshold_changed(self, threshold):
+        """Handle detection threshold change."""
+        self.detection_threshold_changed.emit(threshold)
+        if hasattr(self.settings, 'detection'):
+            self.settings.detection.energy_threshold_dbm = threshold
+    
+    def _on_detection_interval_changed(self, interval):
+        """Handle detection interval change."""
+        self.detection_interval_changed.emit(interval)
+        if hasattr(self.settings, 'detection'):
+            self.settings.detection.detection_interval_ms = interval
+    
+    def _on_manual_detection_triggered(self):
+        """Handle manual detection trigger."""
+        self.manual_detection_triggered.emit()
+    
+    def _on_tdma_detection_triggered(self):
+        """Handle TDMA detection trigger."""
+        self.tdma_detection_triggered.emit()
+    
+    def _on_advanced_analysis_toggled(self, enabled):
+        """Handle advanced analysis toggle."""
+        self.advanced_analysis_toggled.emit(enabled)
+    
+    def update_detection_status(self, detected, snr_db=None, confidence=None):
+        """Update detection status indicators."""
+        if detected:
+            self.detection_status_label.setText("🟢 Signal Detected")
+            self.detection_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.detection_status_label.setText("🔴 No Signal")
+            self.detection_status_label.setStyleSheet("color: red; font-weight: bold;")
+        
+        if snr_db is not None:
+            self.snr_label.setText(f"{snr_db:.1f} dB")
+        else:
+            self.snr_label.setText("-- dB")
+        
+        if confidence is not None:
+            self.confidence_label.setText(f"{confidence:.1f}%")
+        else:
+            self.confidence_label.setText("--.-%")
     
     def _on_auto_detect_coding_toggled(self, checked: bool):
         """Handle auto-detect coding toggle."""

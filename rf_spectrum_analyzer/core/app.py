@@ -173,6 +173,14 @@ class RFSpectrumAnalyzerApp(QObject):
             self.main_window.fft_size_changed.connect(self.change_fft_size)
             self.main_window.window_changed.connect(self.change_window_function)
             self.main_window.averaging_changed.connect(self.change_averaging)
+            
+            # Connect detection signals
+            self.main_window.manual_detection_triggered.connect(self.trigger_manual_detection)
+            self.main_window.tdma_detection_triggered.connect(self.trigger_tdma_detection)
+            self.main_window.auto_detection_toggled.connect(self.toggle_auto_detection)
+            self.main_window.advanced_analysis_toggled.connect(self.toggle_advanced_analysis)
+            self.main_window.detection_threshold_changed.connect(self.change_detection_threshold)
+            self.main_window.detection_interval_changed.connect(self.change_detection_interval)
     
     def setup_timers(self):
         """Setup GUI update timers."""
@@ -271,6 +279,9 @@ class RFSpectrumAnalyzerApp(QObject):
             samples = self.iq_buffer[:fft_size]
             
             self.logger.debug(f"Processing IQ data: {len(samples)} samples")
+            
+            # Update signal processor with current data for detection
+            self.signal_processor.update_current_data(samples)
             
             # Compute spectrum
             spectrum = self.signal_processor.compute_spectrum(samples)
@@ -745,3 +756,78 @@ class RFSpectrumAnalyzerApp(QObject):
             
         except Exception as e:
             self.logger.debug(f"Error generating demo data: {e}")
+    
+    def trigger_manual_detection(self):
+        """Trigger manual signal detection."""
+        try:
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                results = self.signal_processor.detect_signals_manual()
+                if results:
+                    # Update GUI with detection results
+                    if self.main_window:
+                        snr_db = results.get('snr_db', None)
+                        confidence = results.get('confidence', None) * 100 if results.get('confidence') else None
+                        self.main_window.update_detection_status(True, snr_db, confidence)
+                    self.logger.info(f"Manual detection completed: {results}")
+                else:
+                    # No signals detected
+                    if self.main_window:
+                        self.main_window.update_detection_status(False)
+                    self.logger.info("Manual detection: No signals found")
+        except Exception as e:
+            self.logger.error(f"Error in manual detection: {e}")
+    
+    def trigger_tdma_detection(self):
+        """Trigger TDMA burst detection and analysis."""
+        try:
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                results = self.signal_processor.detect_tdma_bursts()
+                if results:
+                    # Update GUI with TDMA detection results
+                    if self.main_window:
+                        num_bursts = len(results.get('bursts', []))
+                        self.main_window.update_detection_status(True, None, num_bursts * 20)  # Confidence based on burst count
+                    self.logger.info(f"TDMA detection completed: {len(results.get('bursts', []))} bursts found")
+                else:
+                    # No TDMA bursts detected
+                    if self.main_window:
+                        self.main_window.update_detection_status(False)
+                    self.logger.info("TDMA detection: No bursts found")
+        except Exception as e:
+            self.logger.error(f"Error in TDMA detection: {e}")
+    
+    def toggle_auto_detection(self, enabled):
+        """Toggle automatic signal detection."""
+        try:
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                self.signal_processor.set_auto_detection(enabled)
+                self.logger.info(f"Auto detection {'enabled' if enabled else 'disabled'}")
+        except Exception as e:
+            self.logger.error(f"Error toggling auto detection: {e}")
+    
+    def toggle_advanced_analysis(self, enabled):
+        """Toggle advanced signal analysis mode."""
+        try:
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                self.signal_processor.set_advanced_analysis(enabled)
+                self.logger.info(f"Advanced analysis {'enabled' if enabled else 'disabled'}")
+        except Exception as e:
+            self.logger.error(f"Error toggling advanced analysis: {e}")
+    
+    def change_detection_threshold(self, threshold_dbm):
+        """Change signal detection threshold."""
+        try:
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                self.signal_processor.set_detection_threshold(threshold_dbm)
+                self.logger.info(f"Detection threshold set to {threshold_dbm} dBm")
+        except Exception as e:
+            self.logger.error(f"Error changing detection threshold: {e}")
+    
+    def change_detection_interval(self, interval_ms):
+        """Change detection check interval."""
+        try:
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                self.signal_processor.set_detection_interval(interval_ms)
+                self.logger.info(f"Detection interval set to {interval_ms} ms")
+        except Exception as e:
+            self.logger.error(f"Error changing detection interval: {e}")

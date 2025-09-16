@@ -29,8 +29,6 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='RF Spectrum Analyzer')
     parser.add_argument('--debug', action='store_true', 
                        help='Enable debug logging')
-    parser.add_argument('--demo', action='store_true',
-                       help='Enable demo mode with simulated data')
     parser.add_argument('--config', type=str, 
                        help='Path to configuration file')
     parser.add_argument('--device', type=str, 
@@ -98,17 +96,12 @@ def main():
         if args.gain:
             settings.sdr.gain = args.gain
         
-        # Enable demo mode if requested
-        if args.demo:
-            settings.demo_mode = True
-            logger.info("Demo mode enabled - using simulated data")
-        
         # Setup Qt application
         qt_app = setup_application()
         
         # Create and run main application
         rf_app = RFSpectrumAnalyzerApp(settings)
-        # Main window is shown from within the app
+        # Main window is shown from within the app initialization
         
         logger.info("RF Spectrum Analyzer started successfully")
         

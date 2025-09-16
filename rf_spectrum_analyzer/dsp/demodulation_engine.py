@@ -410,62 +410,96 @@ class PSKDemodulator(BaseDemodulator):
             logger.error(f"PSK demodulation error: {e}")
             return {"demodulated_data": np.array([]), "error": str(e)}
     def _calculate_evm_advanced(self, received_symbols: np.ndarray, ideal_symbols: np.ndarray) -> float:
-        """Calculate advanced Error Vector Magnitude."""
+        """Calculate advanced Error Vector Magnitude with improved accuracy."""
         try:
-            if len(received_symbols) != len(ideal_symbols):
+            if len(received_symbols) == 0 or len(ideal_symbols) == 0:
                 return 0.0
             
-            error_vector = received_symbols - ideal_symbols
-            signal_power = np.mean(np.abs(ideal_symbols)**2)
+            # Ensure same length
+            min_len = min(len(received_symbols), len(ideal_symbols))
+            received = received_symbols[:min_len]
+            ideal = ideal_symbols[:min_len]
+            
+            # Normalize both signals to have same average power
+            received_norm = received / np.sqrt(np.mean(np.abs(received)**2))
+            ideal_norm = ideal / np.sqrt(np.mean(np.abs(ideal)**2))
+            
+            # Calculate error vector
+            error_vector = received_norm - ideal_norm
+            
+            # EVM as percentage
             error_power = np.mean(np.abs(error_vector)**2)
+            signal_power = np.mean(np.abs(ideal_norm)**2)
             
             if signal_power > 0:
-                evm = np.sqrt(error_power / signal_power)
-                return float(evm)
+                evm_percent = np.sqrt(error_power / signal_power) * 100
+                return float(min(evm_percent, 100.0))  # Cap at 100%
                 
         except Exception as e:
             logger.warning(f"Advanced EVM calculation error: {e}")
         
-        return 0.0
+        return 50.0  # Default moderate EVM
     
     def _estimate_ber_advanced(self, received_symbols: np.ndarray, ideal_symbols: np.ndarray) -> float:
-        """Estimate advanced Bit Error Rate."""
+        """Estimate advanced Bit Error Rate with improved accuracy."""
         try:
-            if len(received_symbols) != len(ideal_symbols):
+            if len(received_symbols) == 0 or len(ideal_symbols) == 0:
                 return 0.0
             
+            # Ensure same length
+            min_len = min(len(received_symbols), len(ideal_symbols))
+            received = received_symbols[:min_len]
+            ideal = ideal_symbols[:min_len]
+            
             # Convert symbols to bits for comparison
-            received_bits = (np.real(received_symbols) > 0).astype(int)
-            ideal_bits = (np.real(ideal_symbols) > 0).astype(int)
+            received_bits = (np.real(received) > 0).astype(int)
+            ideal_bits = (np.real(ideal) > 0).astype(int)
             
             errors = np.sum(received_bits != ideal_bits)
             total_bits = len(received_bits)
             
-            return errors / total_bits if total_bits > 0 else 0.0
+            return float(errors / total_bits) if total_bits > 0 else 0.0
             
         except Exception as e:
             logger.warning(f"Advanced BER estimation error: {e}")
         
         return 0.0
-        """Calculate Error Vector Magnitude."""
+    
+    def _calculate_evm(self, received_symbols: np.ndarray, decided_bits: np.ndarray) -> float:
+        """Calculate Error Vector Magnitude with improved noise handling."""
         try:
-            # Ideal BPSK constellation
-            ideal_symbols = 2 * decided_bits - 1  # Map 0,1 to -1,1
+            if len(received_symbols) == 0 or len(decided_bits) == 0:
+                return 50.0
+                
+            # Create ideal BPSK constellation points
+            ideal_symbols = 2 * decided_bits.astype(float) - 1  # Map 0,1 to -1,1
             
-            # Error vectors
-            error_vectors = received_symbols - ideal_symbols
+            # Ensure same length
+            min_len = min(len(received_symbols), len(ideal_symbols))
+            received = received_symbols[:min_len]
+            ideal = ideal_symbols[:min_len]
             
-            # EVM calculation
-            error_power = np.mean(np.abs(error_vectors) ** 2)
-            signal_power = np.mean(np.abs(ideal_symbols) ** 2)
+            # Normalize signals for fair comparison
+            received_power = np.mean(np.abs(received)**2)
+            ideal_power = np.mean(np.abs(ideal)**2)
             
-            if signal_power > 0:
-                evm = np.sqrt(error_power / signal_power) * 100  # Percentage
-                return float(evm)
+            if received_power > 0 and ideal_power > 0:
+                # Scale received to match ideal power
+                scale_factor = np.sqrt(ideal_power / received_power)
+                received_scaled = received * scale_factor
+                
+                # Calculate error
+                error_vectors = received_scaled - ideal
+                error_power = np.mean(np.abs(error_vectors)**2)
+                
+                # EVM as percentage
+                evm_percent = np.sqrt(error_power / ideal_power) * 100
+                return float(min(evm_percent, 150.0))  # Cap at 150%
+            
         except Exception as e:
             logger.warning(f"EVM calculation error: {e}")
         
-        return 0.0
+        return 50.0  # Default moderate EVM
     
     def _estimate_ber(self, symbols: np.ndarray, bits: np.ndarray) -> float:
         """Estimate Bit Error Rate."""
@@ -1047,6 +1081,41 @@ class QAM16Demodulator(BaseDemodulator):
             logger.warning(f"QAM EVM calculation error: {e}")
         
         return 0.0
+    
+    def _estimate_ber(self, symbols: np.ndarray) -> float:
+        """Estimate Bit Error Rate for QAM."""
+        try:
+            if len(symbols) == 0:
+                return 0.0
+            
+            # Generate ideal constellation
+            ideal_points = self._generate_qam16_constellation()
+            
+            error_count = 0
+            total_bits = 0
+            
+            for symbol in symbols:
+                # Find closest ideal point
+                distances = np.abs(symbol - ideal_points)
+                closest_index = np.argmin(distances)
+                closest_ideal = ideal_points[closest_index]
+                
+                # Simple error estimation based on distance
+                error_distance = np.abs(symbol - closest_ideal)
+                
+                # If distance is large, assume bit errors
+                if error_distance > 0.5:  # Threshold for error detection
+                    error_count += 1  # Assume 1 bit error per symbol for simplicity
+                
+                total_bits += 4  # 4 bits per 16-QAM symbol
+            
+            if total_bits > 0:
+                return float(error_count / total_bits)
+            
+        except Exception as e:
+            logger.warning(f"QAM BER estimation error: {e}")
+        
+        return 0.0
 
 
 class QAM64Demodulator(QAM16Demodulator):
@@ -1099,6 +1168,41 @@ class QAM64Demodulator(QAM16Demodulator):
         points = np.array(points)
         avg_power = np.mean(np.abs(points) ** 2)
         return points / np.sqrt(avg_power)
+    
+    def _estimate_ber(self, symbols: np.ndarray) -> float:
+        """Estimate Bit Error Rate for 64-QAM."""
+        try:
+            if len(symbols) == 0:
+                return 0.0
+            
+            # Generate ideal constellation
+            ideal_points = self._generate_qam64_constellation()
+            
+            error_count = 0
+            total_bits = 0
+            
+            for symbol in symbols:
+                # Find closest ideal point
+                distances = np.abs(symbol - ideal_points)
+                closest_index = np.argmin(distances)
+                closest_ideal = ideal_points[closest_index]
+                
+                # Simple error estimation based on distance
+                error_distance = np.abs(symbol - closest_ideal)
+                
+                # If distance is large, assume bit errors
+                if error_distance > 0.5:  # Threshold for error detection
+                    error_count += 1  # Assume 1 bit error per symbol
+                
+                total_bits += 6  # 6 bits per 64-QAM symbol
+            
+            if total_bits > 0:
+                return float(error_count / total_bits)
+            
+        except Exception as e:
+            logger.warning(f"64-QAM BER estimation error: {e}")
+        
+        return 0.0
 
 
 class QAM256Demodulator(QAM16Demodulator):
