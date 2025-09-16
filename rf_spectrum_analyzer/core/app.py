@@ -115,6 +115,9 @@ class RFSpectrumAnalyzerApp(QObject):
             # Initialize SDR backend manager
             self.sdr_manager = SDRBackendManager(self.settings)
             
+            # Try to connect to SDR device - if fails, enable demo mode
+            self._try_sdr_connection()
+            
             # Initialize main window
             self.main_window = MainWindow(self.settings, self)
             self.main_window.show()
@@ -144,6 +147,35 @@ class RFSpectrumAnalyzerApp(QObject):
         except Exception as e:
             self.logger.error(f"Failed to initialize application: {e}")
             raise
+    
+    def _try_sdr_connection(self):
+        """Try to connect to SDR device, enable demo mode if connection fails."""
+        try:
+            device_type = self.settings.sdr.device_type
+            self.logger.info(f"Attempting to connect to {device_type} device...")
+            
+            if self.sdr_manager.connect():
+                self.logger.info(f"Successfully connected to {device_type}")
+                self.demo_mode = False
+            else:
+                self.logger.warning(f"Failed to connect to {device_type}, enabling demo mode")
+                self._enable_demo_mode()
+                
+        except Exception as e:
+            self.logger.warning(f"SDR connection error: {e}")
+            self.logger.info("Enabling demo mode due to connection failure")
+            self._enable_demo_mode()
+    
+    def _enable_demo_mode(self):
+        """Enable demo mode with synthetic data."""
+        self.demo_mode = True
+        self.settings.demo_mode = True
+        
+        # Create demo timer if it doesn't exist
+        if self.demo_timer is None:
+            self.demo_timer = QTimer()
+        
+        self.logger.info("Demo mode enabled - using synthetic signal data")
     
     def setup_window(self):
         """Setup main window properties."""

@@ -66,6 +66,9 @@ class ControlsWidget(QWidget):
     detection_threshold_changed = Signal(float)
     detection_interval_changed = Signal(int)
     
+    # SpyServer specific signals
+    spyserver_config_changed = Signal(dict)
+    
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.settings = settings
@@ -115,7 +118,7 @@ class ControlsWidget(QWidget):
         device_layout = QFormLayout(device_group)
         
         self.device_combo = QComboBox()
-        self.device_combo.addItems(['rtlsdr', 'hackrf', 'pluto', 'usrp', 'USRP N2xx/X3xx Series', 'soapy', 'file'])
+        self.device_combo.addItems(['rtlsdr', 'hackrf', 'pluto', 'usrp', 'USRP N2xx/X3xx Series', 'soapy', 'spyserver', 'file'])
         self.device_combo.currentTextChanged.connect(self.device_changed.emit)
         device_layout.addRow("Device Type:", self.device_combo)
         
@@ -198,6 +201,41 @@ class ControlsWidget(QWidget):
         radio_layout.addRow("", self.agc_checkbox)
         
         layout.addWidget(radio_group)
+        
+        # SpyServer specific controls group
+        self.spyserver_group = QGroupBox("SpyServer Configuration")
+        spyserver_layout = QFormLayout(self.spyserver_group)
+        
+        # Host and port
+        connection_layout = QHBoxLayout()
+        self.spyserver_host_input = QLineEdit("localhost")
+        self.spyserver_port_input = QSpinBox()
+        self.spyserver_port_input.setRange(1, 65535)
+        self.spyserver_port_input.setValue(5555)
+        connection_layout.addWidget(self.spyserver_host_input)
+        connection_layout.addWidget(QLabel(":"))
+        connection_layout.addWidget(self.spyserver_port_input)
+        spyserver_layout.addRow("Host:Port:", connection_layout)
+        
+        # Timeout
+        self.spyserver_timeout_spinbox = QDoubleSpinBox()
+        self.spyserver_timeout_spinbox.setRange(1.0, 60.0)
+        self.spyserver_timeout_spinbox.setValue(10.0)
+        self.spyserver_timeout_spinbox.setSuffix(" s")
+        spyserver_layout.addRow("Timeout:", self.spyserver_timeout_spinbox)
+        
+        # Connection test button
+        self.spyserver_test_button = QPushButton("Test Connection")
+        self.spyserver_test_button.clicked.connect(self._on_spyserver_test_connection)
+        spyserver_layout.addRow("", self.spyserver_test_button)
+        
+        layout.addWidget(self.spyserver_group)
+        
+        # Hide SpyServer controls initially
+        self.spyserver_group.setVisible(False)
+        
+        # Connect device type change to show/hide SpyServer controls
+        self.device_combo.currentTextChanged.connect(self._on_device_type_changed)
         
         self.tab_widget.addTab(device_widget, "Device")
     
@@ -742,7 +780,79 @@ class ControlsWidget(QWidget):
         """Update the detected modulation display."""
         if self.auto_detect_mod_checkbox.isChecked():
             self.modulation_combo.setCurrentText(modulation)
-            self.modulation_detected.emit(modulation)
+    
+    def _on_device_type_changed(self, device_type: str):
+        """Handle device type change to show/hide specific controls."""
+        # Show/hide SpyServer controls
+        is_spyserver = device_type == "spyserver"
+        self.spyserver_group.setVisible(is_spyserver)
+        
+        # Emit device changed signal
+        self.device_changed.emit(device_type)
+    
+    def _on_spyserver_test_connection(self):
+        """Test SpyServer connection."""
+        try:
+            # Import here to avoid circular imports
+            from sdrconnect import SpyServerClient, SDRConfig as SDRConnectConfig
+            
+            host = self.spyserver_host_input.text()
+            port = self.spyserver_port_input.value()
+            timeout = self.spyserver_timeout_spinbox.value()
+            
+            config = SDRConnectConfig(host=host, port=port, timeout=timeout)
+            client = SpyServerClient(config)
+            
+            self.spyserver_test_button.setText("Testing...")
+            self.spyserver_test_button.setEnabled(False)
+            
+            # Try to connect
+            client.connect()
+            device_info = client.get_device_info()
+            client.disconnect()
+            
+            # Success
+            self.spyserver_test_button.setText("✓ Connected")
+            self.spyserver_test_button.setStyleSheet("QPushButton { color: green; font-weight: bold; }")
+            
+            # Update settings
+            if not hasattr(self.settings.sdr, 'spyserver_host'):
+                self.settings.sdr.spyserver_host = host
+            else:
+                self.settings.sdr.spyserver_host = host
+            if not hasattr(self.settings.sdr, 'spyserver_port'):
+                self.settings.sdr.spyserver_port = port
+            else:
+                self.settings.sdr.spyserver_port = port
+            if not hasattr(self.settings.sdr, 'spyserver_timeout'):
+                self.settings.sdr.spyserver_timeout = timeout
+            else:
+                self.settings.sdr.spyserver_timeout = timeout
+            
+        except ImportError:
+            self.spyserver_test_button.setText("✗ sdrconnect not installed")
+            self.spyserver_test_button.setStyleSheet("QPushButton { color: red; font-weight: bold; }")
+        except Exception as e:
+            self.spyserver_test_button.setText(f"✗ Failed: {str(e)[:20]}...")
+            self.spyserver_test_button.setStyleSheet("QPushButton { color: red; font-weight: bold; }")
+        finally:
+            # Reset button after 3 seconds
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(3000, self._reset_spyserver_test_button)
+    
+    def _reset_spyserver_test_button(self):
+        """Reset SpyServer test button to default state."""
+        self.spyserver_test_button.setText("Test Connection")
+        self.spyserver_test_button.setStyleSheet("")
+        self.spyserver_test_button.setEnabled(True)
+    
+    def get_spyserver_config(self) -> dict:
+        """Get SpyServer configuration from controls."""
+        return {
+            'host': self.spyserver_host_input.text(),
+            'port': self.spyserver_port_input.value(),
+            'timeout': self.spyserver_timeout_spinbox.value()
+        }
     
     def update_detected_encoding(self, encoding: str):
         """Update the detected encoding display."""

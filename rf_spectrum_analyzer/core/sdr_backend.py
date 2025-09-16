@@ -67,6 +67,7 @@ class SDRDeviceType(Enum):
     PLUTO = "pluto"
     SOAPY = "soapy"
     USRP = "usrp"
+    SPYSERVER = "spyserver"
     FILE = "file"
     AUDIO = "audio"
 
@@ -533,11 +534,14 @@ class SDRBackendManager:
     
     def _initialize_backends(self):
         """Initialize all available backends."""
+        from rf_spectrum_analyzer.backends.spyserver_backend import SpyServerBackend
+        
         self.available_backends = {
             SDRDeviceType.RTLSDR: RTLSDRBackend(self.settings),
             SDRDeviceType.HACKRF: HackRFBackend(self.settings),
             SDRDeviceType.PLUTO: PlutoSDRBackend(self.settings),
             SDRDeviceType.SOAPY: SoapySDRBackend(self.settings),
+            SDRDeviceType.SPYSERVER: SpyServerBackend(self.settings),
             SDRDeviceType.FILE: FileBackend(self.settings),
         }
     

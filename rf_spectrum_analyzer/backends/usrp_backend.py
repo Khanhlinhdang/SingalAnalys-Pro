@@ -18,7 +18,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 try:
-    from usrp_interface import create_usrp_interface, USRP_AVAILABLE
+    from rf_spectrum_analyzer.backends.usrp_interface import create_usrp_interface, USRP_AVAILABLE
     USRP_BACKEND_AVAILABLE = True
 except ImportError as e:
     logger = get_logger('usrp_backend')

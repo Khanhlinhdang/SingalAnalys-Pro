@@ -8,8 +8,11 @@ import yaml
 import json
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 import logging
+
+if TYPE_CHECKING:
+    from sdrconnect import SDRConfig
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SDRSettings:
     """SDR device configuration settings."""
-    device_type: str = "rtlsdr"  # rtlsdr, hackrf, pluto, soapy, usrp
+    device_type: str = "rtlsdr"  # rtlsdr, hackrf, pluto, soapy, usrp, spyserver
     center_frequency: float = 100e6  # Hz
     sample_rate: float = 2e6  # Hz
     gain: float = 20.0  # dB
@@ -33,6 +36,44 @@ class SDRSettings:
     hackrf_lna_gain: float = 16.0
     hackrf_vga_gain: float = 16.0
     pluto_buffer_size: int = 1024
+    
+    # SpyServer specific parameters
+    spyserver_host: str = "localhost"
+    spyserver_port: int = 5555
+    spyserver_timeout: float = 10.0
+    
+    def to_sdrconfig(self) -> Optional['SDRConfig']:
+        """Convert to sdrconnect SDRConfig format."""
+        try:
+            from sdrconnect import SDRConfig
+            return SDRConfig(
+                host=self.spyserver_host,
+                port=self.spyserver_port,
+                timeout=self.spyserver_timeout,
+                frequency=int(self.center_frequency),
+                sample_rate=int(self.sample_rate),
+                gain=int(self.gain) if self.gain is not None else None,
+                bandwidth=int(self.bandwidth) if self.bandwidth else None,
+                bias_tee=self.bias_tee
+            )
+        except ImportError:
+            return None
+    
+    def from_sdrconfig(self, sdrconfig: 'SDRConfig') -> None:
+        """Update from sdrconnect SDRConfig."""
+        try:
+            self.spyserver_host = sdrconfig.host
+            self.spyserver_port = sdrconfig.port
+            self.spyserver_timeout = sdrconfig.timeout
+            self.center_frequency = float(sdrconfig.frequency)
+            self.sample_rate = float(sdrconfig.sample_rate)
+            if sdrconfig.gain is not None:
+                self.gain = float(sdrconfig.gain)
+            if sdrconfig.bandwidth is not None:
+                self.bandwidth = float(sdrconfig.bandwidth)
+            self.bias_tee = sdrconfig.bias_tee
+        except Exception as e:
+            logger.error(f"Error updating from SDRConfig: {e}")
 
 
 @dataclass
@@ -243,6 +284,10 @@ class Settings:
         except Exception as e:
             logger.error(f"Failed to save settings to {config_path}: {e}")
     
+    def save(self) -> None:
+        """Save settings to the default config file."""
+        self.save_to_file()
+    
     def load_from_file(self, filename: str) -> None:
         """Load settings from YAML file."""
         config_path = Path(filename)
@@ -288,8 +333,44 @@ class Settings:
                 "buffer_size": self.sdr.pluto_buffer_size,
                 "antenna": self.sdr.antenna,
             })
+        elif self.sdr.device_type == "spyserver":
+            base_settings.update({
+                "host": self.sdr.spyserver_host,
+                "port": self.sdr.spyserver_port,
+                "timeout": self.sdr.spyserver_timeout,
+            })
         
         return base_settings
+    
+    def save_sdrconfig(self, filepath: str) -> bool:
+        """Save current settings as sdrconnect SDRConfig format."""
+        try:
+            sdrconfig = self.sdr.to_sdrconfig()
+            if sdrconfig is None:
+                logger.error("sdrconnect not available for config export")
+                return False
+            
+            sdrconfig.save(filepath)
+            logger.info(f"SDRConfig saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save SDRConfig: {e}")
+            return False
+    
+    def load_sdrconfig(self, filepath: str) -> bool:
+        """Load settings from sdrconnect SDRConfig format."""
+        try:
+            from sdrconnect import SDRConfig
+            sdrconfig = SDRConfig.load(filepath)
+            self.sdr.from_sdrconfig(sdrconfig)
+            logger.info(f"SDRConfig loaded from {filepath}")
+            return True
+        except ImportError:
+            logger.error("sdrconnect not available for config import")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load SDRConfig: {e}")
+            return False
     
     def validate_settings(self) -> bool:
         """Validate current settings for consistency."""

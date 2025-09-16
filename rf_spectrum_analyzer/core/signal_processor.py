@@ -40,6 +40,7 @@ from rf_spectrum_analyzer.dsp.demodulation_engine import create_demodulation_eng
 from rf_spectrum_analyzer.dsp.decoding_engine import create_decoding_engine
 from rf_spectrum_analyzer.dsp.signal_detection import create_signal_detector
 from rf_spectrum_analyzer.dsp.tdma_detector import TDMABurstDetector
+from rf_spectrum_analyzer.dsp.enhanced_analysis import EnhancedSignalAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +107,18 @@ class SignalProcessor:
         self.signal_detector = create_signal_detector(settings.sdr.sample_rate)
         self.tdma_detector = TDMABurstDetector(settings.sdr.sample_rate)
         
+        # Enhanced analysis engine (with sdrconnect integration)
+        self.enhanced_analyzer = EnhancedSignalAnalysis(
+            sample_rate=settings.sdr.sample_rate,
+            fft_size=self.fft_size
+        )
+        
         # Analysis results cache
         self.last_modulation_analysis = None
         self.last_encoding_analysis = None
         self.last_detection_result = None
         self.last_tdma_analysis = None
+        self.last_enhanced_analysis = None
         
         # Detection state variables
         self._current_iq_data = None
@@ -1322,3 +1330,87 @@ class SignalProcessor:
                     
         except Exception as e:
             self.logger.debug(f"Auto detection error: {e}")
+    
+    def enhanced_analysis(self, iq_samples: np.ndarray) -> Dict[str, Any]:
+        """
+        Perform enhanced signal analysis using sdrconnect integration.
+        
+        Args:
+            iq_samples: Complex IQ samples
+            
+        Returns:
+            Enhanced analysis result dictionary
+        """
+        try:
+            if len(iq_samples) == 0:
+                return {"success": False, "error": "Empty signal"}
+            
+            # Perform enhanced analysis
+            result = self.enhanced_analyzer.analyze_iq_data(iq_samples)
+            
+            # Cache result
+            self.last_enhanced_analysis = result
+            
+            # Convert to dictionary for easier handling
+            analysis_dict = {
+                "success": True,
+                "analysis_method": result.analysis_method,
+                "sdrconnect_available": result.sdrconnect_available,
+                
+                # Basic spectrum data
+                "power_spectrum": result.power_spectrum.tolist() if len(result.power_spectrum) > 0 else [],
+                "frequency_axis": result.frequency_axis.tolist() if len(result.frequency_axis) > 0 else [],
+                "peak_frequency": result.peak_frequency,
+                "bandwidth": result.bandwidth,
+                "snr_estimate": result.snr_estimate,
+                
+                # Enhanced data (if available)
+                "has_enhanced_data": result.sdrconnect_available and result.analysis_method == "enhanced"
+            }
+            
+            # Add enhanced metrics if available
+            if result.sdrconnect_available and result.analysis_method == "enhanced":
+                enhanced_metrics = {
+                    "rms_power": result.rms_power,
+                    "peak_power": result.peak_power,
+                    "crest_factor": result.crest_factor,
+                    "dc_offset_i": result.dc_offset_i,
+                    "dc_offset_q": result.dc_offset_q,
+                    "zero_crossings": result.zero_crossings,
+                    "noise_floor": result.noise_floor,
+                    "sinad": result.sinad,
+                    "occupied_bandwidth": result.occupied_bandwidth,
+                    "frequency_drift": result.frequency_drift,
+                    "spur_frequencies": result.spur_frequencies,
+                }
+                
+                # Add arrays if available
+                if result.spectrogram is not None:
+                    enhanced_metrics["spectrogram"] = result.spectrogram.tolist()
+                if result.mean_psd is not None:
+                    enhanced_metrics["mean_psd"] = result.mean_psd.tolist()
+                if result.time_axis is not None:
+                    enhanced_metrics["time_axis"] = result.time_axis.tolist()
+                
+                analysis_dict["enhanced_metrics"] = enhanced_metrics
+            
+            self.logger.debug(f"Enhanced analysis completed using {result.analysis_method} method")
+            
+            return analysis_dict
+            
+        except Exception as e:
+            self.logger.error(f"Enhanced analysis error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def get_analysis_capabilities(self) -> Dict[str, Any]:
+        """Get information about analysis capabilities."""
+        return {
+            "sdr_available": SDR_AVAILABLE,
+            "scikit_dsp_available": SCIKIT_DSP_AVAILABLE,
+            "pyfftw_available": PYFFTW_AVAILABLE,
+            "enhanced_analysis": self.enhanced_analyzer.get_analysis_info(),
+            "fft_method": getattr(self, 'fft_method', 'numpy'),
+            "window_type": self.window_type,
+            "fft_size": self.fft_size,
+            "averaging": self.averaging
+        }
