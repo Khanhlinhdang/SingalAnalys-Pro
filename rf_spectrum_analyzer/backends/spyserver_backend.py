@@ -97,6 +97,36 @@ class SpyServerBackend(SDRBackend):
                 self.spyserver_client = None
                 self.connected = False
     
+    def _attempt_reconnection(self, max_retries: int = 3) -> bool:
+        """Attempt to reconnect to SpyServer with retries."""
+        import time
+        
+        for attempt in range(max_retries):
+            logger.info(f"Reconnection attempt {attempt + 1}/{max_retries}")
+            
+            # Clean up existing connection
+            if self.spyserver_client:
+                try:
+                    self.spyserver_client.disconnect()
+                except:
+                    pass
+                self.spyserver_client = None
+                self.connected = False
+            
+            # Wait before retry (exponential backoff)
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 10)  # Max 10 seconds
+                logger.info(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            
+            # Attempt to reconnect
+            if self.connect():
+                logger.info("SpyServer reconnection successful")
+                return True
+            
+        logger.error(f"Failed to reconnect to SpyServer after {max_retries} attempts")
+        return False
+    
     def configure(self, config: Dict[str, Any]) -> bool:
         """Configure SpyServer parameters."""
         if not self.connected or not self.spyserver_client:
@@ -134,7 +164,7 @@ class SpyServerBackend(SDRBackend):
             return False
     
     def read_samples(self, num_samples: int) -> Optional[np.ndarray]:
-        """Read IQ samples from SpyServer."""
+        """Read IQ samples from SpyServer with automatic reconnection."""
         if not self.connected or not self.spyserver_client:
             logger.error("SpyServer not connected")
             return None
@@ -153,12 +183,33 @@ class SpyServerBackend(SDRBackend):
             
             return samples.astype(np.complex64)
             
+        except (ConnectionError, OSError) as e:
+            # Handle connection errors (including WinError 10053)
+            error_code = getattr(e, 'winerror', getattr(e, 'errno', None))
+            if error_code == 10053 or "connection" in str(e).lower():
+                logger.warning(f"SpyServer connection lost: {e}. Attempting to reconnect...")
+                # Mark as disconnected and attempt reconnection
+                self.connected = False
+                if self._attempt_reconnection():
+                    # Retry reading samples after successful reconnection
+                    try:
+                        if not self.spyserver_client.is_streaming:
+                            self.spyserver_client.start_streaming()
+                        samples = self.spyserver_client.read_samples(num_samples)
+                        if len(samples) > 0:
+                            return samples.astype(np.complex64)
+                    except Exception as retry_e:
+                        logger.error(f"Failed to read samples after reconnection: {retry_e}")
+                return None
+            else:
+                logger.error(f"Error reading samples from SpyServer: {e}")
+                return None
         except Exception as e:
             logger.error(f"Error reading samples from SpyServer: {e}")
             return None
     
     def read_samples_timeout(self, duration: float) -> Optional[np.ndarray]:
-        """Read IQ samples for specified duration from SpyServer."""
+        """Read IQ samples for specified duration from SpyServer with automatic reconnection."""
         if not self.connected or not self.spyserver_client:
             logger.error("SpyServer not connected")
             return None
@@ -177,12 +228,33 @@ class SpyServerBackend(SDRBackend):
             
             return samples.astype(np.complex64)
             
+        except (ConnectionError, OSError) as e:
+            # Handle connection errors (including WinError 10053)
+            error_code = getattr(e, 'winerror', getattr(e, 'errno', None))
+            if error_code == 10053 or "connection" in str(e).lower():
+                logger.warning(f"SpyServer connection lost during timeout read: {e}. Attempting to reconnect...")
+                # Mark as disconnected and attempt reconnection
+                self.connected = False
+                if self._attempt_reconnection():
+                    # Retry reading samples after successful reconnection
+                    try:
+                        if not self.spyserver_client.is_streaming:
+                            self.spyserver_client.start_streaming()
+                        samples = self.spyserver_client.read_samples_timeout(duration)
+                        if len(samples) > 0:
+                            return samples.astype(np.complex64)
+                    except Exception as retry_e:
+                        logger.error(f"Failed to read samples after reconnection: {retry_e}")
+                return None
+            else:
+                logger.error(f"Error reading samples from SpyServer: {e}")
+                return None
         except Exception as e:
             logger.error(f"Error reading samples from SpyServer: {e}")
             return None
     
     def read_samples_with_metadata(self, duration: float) -> Optional[tuple]:
-        """Read IQ samples with timing metadata (SpyServer specific feature)."""
+        """Read IQ samples with timing metadata (SpyServer specific feature) with automatic reconnection."""
         if not self.connected or not self.spyserver_client:
             logger.error("SpyServer not connected")
             return None
@@ -201,6 +273,27 @@ class SpyServerBackend(SDRBackend):
             
             return samples.astype(np.complex64), timestamps, latencies
             
+        except (ConnectionError, OSError) as e:
+            # Handle connection errors (including WinError 10053)
+            error_code = getattr(e, 'winerror', getattr(e, 'errno', None))
+            if error_code == 10053 or "connection" in str(e).lower():
+                logger.warning(f"SpyServer connection lost during metadata read: {e}. Attempting to reconnect...")
+                # Mark as disconnected and attempt reconnection
+                self.connected = False
+                if self._attempt_reconnection():
+                    # Retry reading samples after successful reconnection
+                    try:
+                        if not self.spyserver_client.is_streaming:
+                            self.spyserver_client.start_streaming()
+                        samples, timestamps, latencies = self.spyserver_client.read_iq_samples_with_metadata(duration)
+                        if len(samples) > 0:
+                            return samples.astype(np.complex64), timestamps, latencies
+                    except Exception as retry_e:
+                        logger.error(f"Failed to read samples with metadata after reconnection: {retry_e}")
+                return None
+            else:
+                logger.error(f"Error reading samples with metadata from SpyServer: {e}")
+                return None
         except Exception as e:
             logger.error(f"Error reading samples with metadata from SpyServer: {e}")
             return None
@@ -339,6 +432,28 @@ class SpyServerBackend(SDRBackend):
                 "port": self.port,
                 "error": str(e)
             }
+    
+    def is_connection_healthy(self) -> bool:
+        """Check if SpyServer connection is healthy."""
+        if not self.connected or not self.spyserver_client:
+            return False
+        
+        try:
+            # Try to get device info as a health check
+            self.spyserver_client.get_device_info()
+            return True
+        except (ConnectionError, OSError) as e:
+            error_code = getattr(e, 'winerror', getattr(e, 'errno', None))
+            if error_code == 10053 or "connection" in str(e).lower():
+                logger.warning(f"Connection health check failed: {e}")
+                self.connected = False
+                return False
+            else:
+                logger.warning(f"Connection health check failed: {e}")
+                return False
+        except Exception as e:
+            logger.warning(f"Connection health check failed: {e}")
+            return False
 
     @staticmethod
     def detect_devices() -> List[SDRDevice]:

@@ -247,7 +247,7 @@ class WaterfallWidget(QWidget):
             plot = self.plot_widget.getPlotItem()
             if len(self.frequency_axis) > 0:
                 plot.setXRange(self.frequency_axis[0], self.frequency_axis[-1])
-            plot.setYRange(0, len(self.waterfall_data))
+            # plot.setYRange(0, len(self.waterfall_data))
             
         except Exception as e:
             print(f"Error updating waterfall image: {e}")

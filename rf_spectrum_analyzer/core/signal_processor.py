@@ -293,11 +293,44 @@ class SignalProcessor:
             if self.averaging > 1:
                 power_db_shifted = self._apply_optimized_averaging(power_db_shifted)
             
+            # Validate the spectrum data to prevent GUI errors
+            if not self._validate_spectrum_data(power_db_shifted):
+                self.logger.warning("Invalid spectrum data detected, skipping frame")
+                return None
+            
             return power_db_shifted
             
         except Exception as e:
             self.logger.error(f"Error computing spectrum: {e}")
             return None
+    
+    def _validate_spectrum_data(self, spectrum: np.ndarray) -> bool:
+        """Validate spectrum data to prevent GUI errors."""
+        try:
+            # Check for empty array
+            if len(spectrum) == 0:
+                return False
+            
+            # Check for NaN or infinite values
+            if not np.isfinite(spectrum).all():
+                # Replace invalid values with reasonable defaults
+                spectrum[~np.isfinite(spectrum)] = -120.0  # Default noise floor
+                
+            # Check for reasonable range (spectrum should be in dB)
+            min_val = np.min(spectrum)
+            max_val = np.max(spectrum)
+            
+            # Reasonable spectrum range should be between -200 and +100 dB
+            if min_val < -200 or max_val > 100:
+                self.logger.debug(f"Spectrum values outside expected range: min={min_val:.1f}, max={max_val:.1f}")
+                # Clamp values to reasonable range
+                np.clip(spectrum, -200, 100, out=spectrum)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Error validating spectrum data: {e}")
+            return False
     
     def _apply_averaging(self, spectrum: np.ndarray) -> np.ndarray:
         """Apply spectrum averaging."""

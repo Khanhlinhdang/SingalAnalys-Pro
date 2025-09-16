@@ -5,7 +5,7 @@ High-performance spectrum visualization with interactive features.
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QFont
 
@@ -17,6 +17,7 @@ class SpectrumWidget(QWidget):
     
     frequency_clicked = Signal(float)  # Emitted when user clicks on frequency
     frequency_range_selected = Signal(float, float)  # Emitted when user selects frequency range
+    signal_analysis_requested = Signal(dict)  # Emitted when user requests signal analysis
     
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -36,9 +37,7 @@ class SpectrumWidget(QWidget):
         self.peak_threshold = -60.0  # dB
         self.detected_peaks = []
         
-        # Frequency analysis markers
-        self.f1_marker = None
-        self.f2_marker = None
+        # Frequency analysis markers - now only using LinearRegionItem
         self.freq_range_region = None
         self.markers_enabled = False
         self.f1_frequency = 0.0
@@ -67,6 +66,18 @@ class SpectrumWidget(QWidget):
         control_layout.addWidget(title_label)
         
         control_layout.addStretch()
+        
+        # Center frequency button
+        self.center_button = QPushButton("Center")
+        self.center_button.setToolTip("Move frequency range to center frequency")
+        self.center_button.clicked.connect(self._on_center_button_clicked)
+        control_layout.addWidget(self.center_button)
+        
+        # Signal analysis button
+        self.analyze_button = QPushButton("Analyze Signal")
+        self.analyze_button.setToolTip("Analyze signal in selected frequency range")
+        self.analyze_button.clicked.connect(self._on_analyze_button_clicked)
+        control_layout.addWidget(self.analyze_button)
         
         # Peak detection checkbox
         self.peaks_checkbox = QCheckBox("Show Peaks")
@@ -101,7 +112,14 @@ class SpectrumWidget(QWidget):
         plot.setTitle('RF Spectrum')
         
         # Set axis ranges
-        plot.setYRange(self.min_db, self.max_db)
+        # Validate initial Y range values
+        if not (np.isfinite(self.min_db) and np.isfinite(self.max_db) and self.min_db < self.max_db):
+            print(f"Warning: Invalid initial Y range: min={self.min_db}, max={self.max_db}, using defaults")
+            self.min_db = -120.0  # Default minimum
+            self.max_db = 0.0     # Default maximum
+        
+        # Convert to Python float for PyQtGraph compatibility
+        plot.setYRange(float(self.min_db), float(self.max_db))
         
         # Enable grid
         if self.settings.gui.grid_enabled:
@@ -133,50 +151,25 @@ class SpectrumWidget(QWidget):
         plot.addItem(self.ref_line)
         
         # Create crosshair cursor
-        self.crosshair_v = pg.InfiniteLine(angle=90, movable=False)
-        self.crosshair_h = pg.InfiniteLine(angle=0, movable=False)
-        plot.addItem(self.crosshair_v, ignoreBounds=True)
-        plot.addItem(self.crosshair_h, ignoreBounds=True)
+        # self.crosshair_v = pg.InfiniteLine(angle=90, movable=False)
+        # self.crosshair_h = pg.InfiniteLine(angle=0, movable=False)
+        # plot.addItem(self.crosshair_v, ignoreBounds=True)
+        # plot.addItem(self.crosshair_h, ignoreBounds=True)
         
-        # Create frequency analysis markers (f1, f2)
-        self.f1_marker = pg.InfiniteLine(
-            angle=90,
-            pos=100e6,  # Default 100 MHz
-            pen=pg.mkPen(color='lime', width=2, style=Qt.DashLine),
-            label='f1',
-            labelOpts={'color': 'lime', 'position': 0.95, 'anchors': [(0, 0), (0, 0)]},
-            movable=True
-        )
-        
-        self.f2_marker = pg.InfiniteLine(
-            angle=90,
-            pos=200e6,  # Default 200 MHz
-            pen=pg.mkPen(color='cyan', width=2, style=Qt.DashLine),
-            label='f2',
-            labelOpts={'color': 'cyan', 'position': 0.95, 'anchors': [(0, 0), (0, 0)]},
-            movable=True
-        )
-        
-        # Create frequency range region
+        # Create frequency range region (replaces f1_marker and f2_marker)
         self.freq_range_region = pg.LinearRegionItem(
-            values=[100e6, 200e6],
+            values=[1544e6, 1546e6],  # Default range around center
             brush=pg.mkBrush(0, 255, 0, 30),  # Semi-transparent green
-            pen=pg.mkPen(color='green', width=1),
+            pen=pg.mkPen(color='green', width=2),
             movable=True
         )
         
-        # Initially hide frequency markers
-        self.f1_marker.setVisible(False)
-        self.f2_marker.setVisible(False)
+        # Initially hide frequency region
         self.freq_range_region.setVisible(False)
         
-        plot.addItem(self.f1_marker)
-        plot.addItem(self.f2_marker)
         plot.addItem(self.freq_range_region)
         
-        # Connect marker movement signals
-        self.f1_marker.sigPositionChanged.connect(self._on_f1_marker_moved)
-        self.f2_marker.sigPositionChanged.connect(self._on_f2_marker_moved)
+        # Connect region movement signal
         self.freq_range_region.sigRegionChanged.connect(self._on_frequency_region_changed)
         
         # Connect mouse events
@@ -184,8 +177,8 @@ class SpectrumWidget(QWidget):
         self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
         
         # Set initial visibility
-        self.crosshair_v.setVisible(False)
-        self.crosshair_h.setVisible(False)
+        # self.crosshair_v.setVisible(False)
+        # self.crosshair_h.setVisible(False)
     
     def update_data(self, spectrum_data: np.ndarray):
         """Update spectrum display with new data."""
@@ -268,8 +261,11 @@ class SpectrumWidget(QWidget):
                 peak_freqs = self.frequency_axis[peaks]
                 peak_powers = data_to_analyze[peaks]
                 
+                # Convert to lists to avoid numpy array issues
+                pos_data = [(float(f), float(p)) for f, p in zip(peak_freqs, peak_powers)]
+                
                 self.peak_scatter.setData(
-                    pos=list(zip(peak_freqs, peak_powers)),
+                    pos=pos_data,
                     brush=[pg.mkBrush(255, 0, 0, 120)] * len(peaks)
                 )
                 
@@ -310,8 +306,11 @@ class SpectrumWidget(QWidget):
             peak_freqs = self.frequency_axis[peaks]
             peak_powers = self.spectrum_data[peaks]
             
+            # Convert to lists to avoid numpy array issues
+            pos_data = [(float(f), float(p)) for f, p in zip(peak_freqs, peak_powers)]
+            
             self.peak_scatter.setData(
-                pos=list(zip(peak_freqs, peak_powers)),
+                pos=pos_data,
                 brush=[pg.mkBrush(255, 0, 0, 120)] * len(peaks)
             )
             
@@ -326,13 +325,32 @@ class SpectrumWidget(QWidget):
             return
         
         try:
-            data_min = np.min(self.spectrum_data)
-            data_max = np.max(self.spectrum_data)
+            # Check if data contains valid numeric values
+            if not np.isfinite(self.spectrum_data).any():
+                return
+                
+            data_min = np.nanmin(self.spectrum_data)
+            data_max = np.nanmax(self.spectrum_data)
+            
+            # Ensure valid numeric values
+            if not (np.isfinite(data_min) and np.isfinite(data_max)):
+                return
+            
+            # Ensure min < max
+            if data_min >= data_max:
+                # If all values are the same, create a small range
+                data_range = max(1.0, abs(data_min))  # Minimum 1 dB range
+                data_min = data_min - data_range
+                data_max = data_max + data_range
             
             # Add some margin
-            margin = (data_max - data_min) * 0.1
+            margin = max(1.0, (data_max - data_min) * 0.1)  # Minimum 1 dB margin
             y_min = data_min - margin
             y_max = data_max + margin
+            
+            # Ensure final values are valid and min < max
+            if not (np.isfinite(y_min) and np.isfinite(y_max) and y_min < y_max):
+                return
             
             # Update Y range if significantly different
             plot = self.plot_widget.getPlotItem()
@@ -340,9 +358,15 @@ class SpectrumWidget(QWidget):
             
             if (abs(current_range[0] - y_min) > 10 or 
                 abs(current_range[1] - y_max) > 10):
-                plot.setYRange(y_min, y_max, padding=0)
+                # Add extra validation before setYRange call
+                if np.isfinite(y_min) and np.isfinite(y_max) and y_min < y_max:
+                    # Convert to Python float to ensure PyQtGraph compatibility
+                    y_min_f = float(y_min)
+                    y_max_f = float(y_max)
+                    plot.setYRange(y_min_f, y_max_f, padding=0)
                 
-        except Exception:
+        except Exception as e:
+            # Log the error but don't crash - silently handle  
             pass
     
     def _on_mouse_moved(self, pos):
@@ -351,18 +375,18 @@ class SpectrumWidget(QWidget):
             mouse_point = self.plot_widget.getPlotItem().vb.mapSceneToView(pos)
             
             # Update crosshair position
-            self.crosshair_v.setPos(mouse_point.x())
-            self.crosshair_h.setPos(mouse_point.y())
-            self.crosshair_v.setVisible(True)
-            self.crosshair_h.setVisible(True)
+            # self.crosshair_v.setPos(mouse_point.x())
+            # self.crosshair_h.setPos(mouse_point.y())
+            # self.crosshair_v.setVisible(True)
+            # self.crosshair_h.setVisible(True)
             
             # Update info label
             freq_mhz = mouse_point.x() / 1e6
             power_db = mouse_point.y()
             self.info_label.setText(f"Freq: {freq_mhz:.3f} MHz, Power: {power_db:.1f} dB")
         else:
-            self.crosshair_v.setVisible(False)
-            self.crosshair_h.setVisible(False)
+            # self.crosshair_v.setVisible(False)
+            # self.crosshair_h.setVisible(False)
             self.info_label.setText("")
     
     def _on_mouse_clicked(self, event):
@@ -387,6 +411,36 @@ class SpectrumWidget(QWidget):
         plot.showGrid(x=checked, y=checked, alpha=self.settings.gui.grid_alpha)
         self.settings.gui.grid_enabled = checked
     
+    def _on_center_button_clicked(self):
+        """Handle center button click - move frequency range to center frequency."""
+        center_freq = self.settings.sdr.center_frequency
+        sample_rate = self.settings.sdr.sample_rate
+        
+        # Create a reasonable range around center frequency (10% of sample rate)
+        range_width = sample_rate * 0.1
+        f1 = center_freq - range_width / 2
+        f2 = center_freq + range_width / 2
+        
+        # Update the frequency range
+        self.set_frequency_range(f1, f2)
+        
+        # Ensure markers are visible
+        if not self.markers_enabled:
+            self.set_frequency_markers_enabled(True)
+    
+    def _on_analyze_button_clicked(self):
+        """Handle analyze signal button click."""
+        if not self.markers_enabled:
+            # Show message that frequency range needs to be selected
+            self.info_label.setText("Please enable frequency markers first")
+            return
+        
+        analysis_request = self.request_signal_analysis()
+        if analysis_request is None:
+            self.info_label.setText("No signal detected in selected range")
+        else:
+            self.info_label.setText(f"Analyzing signal at {analysis_request['center_freq']/1e6:.3f} MHz...")
+    
     def set_reference_level(self, ref_level: float):
         """Set reference level line."""
         self.ref_level = ref_level
@@ -394,10 +448,24 @@ class SpectrumWidget(QWidget):
     
     def set_y_range(self, min_db: float, max_db: float):
         """Set Y axis range."""
-        self.min_db = min_db
-        self.max_db = max_db
+        # Ensure valid numeric values
+        if not (np.isfinite(min_db) and np.isfinite(max_db)):
+            return
+        
+        # Ensure min < max
+        if min_db >= max_db:
+            min_db, max_db = max_db, min_db
+        
+        # Convert to Python float for PyQtGraph compatibility
+        self.min_db = float(min_db)
+        self.max_db = float(max_db)
         plot = self.plot_widget.getPlotItem()
-        plot.setYRange(min_db, max_db)
+        # Set initial Y range with validation
+        min_val = float(self.min_db) if np.isfinite(self.min_db) else -100.0
+        max_val = float(self.max_db) if np.isfinite(self.max_db) else 0.0
+        if min_val >= max_val:
+            min_val, max_val = max_val - 10.0, min_val + 10.0
+        plot.setYRange(min_val, max_val)
     
     def set_peak_threshold(self, threshold: float):
         """Set peak detection threshold."""
@@ -448,19 +516,15 @@ class SpectrumWidget(QWidget):
     
     # Frequency Analysis Methods
     def set_frequency_markers_enabled(self, enabled: bool):
-        """Enable or disable frequency markers display."""
+        """Enable or disable frequency range display."""
         self.markers_enabled = enabled
-        self.f1_marker.setVisible(enabled)
-        self.f2_marker.setVisible(enabled)
         self.freq_range_region.setVisible(enabled)
     
     def set_frequency_range(self, f1: float, f2: float):
-        """Set frequency range markers."""
+        """Set frequency range region."""
         self.f1_frequency = f1
         self.f2_frequency = f2
         
-        self.f1_marker.setPos(f1)
-        self.f2_marker.setPos(f2)
         self.freq_range_region.setRegion([f1, f2])
     
     def set_peak_hold_enabled(self, enabled: bool):
@@ -473,43 +537,12 @@ class SpectrumWidget(QWidget):
         """Reset peak hold data."""
         self.peak_hold_data = np.array([])
     
-    def _on_f1_marker_moved(self):
-        """Handle f1 marker movement."""
-        f1 = self.f1_marker.value()
-        f2 = self.f2_marker.value()
-        
-        # Ensure f1 < f2
-        if f1 >= f2:
-            f1 = f2 - 1e6  # 1 MHz minimum difference
-            self.f1_marker.setPos(f1)
-        
-        self.f1_frequency = f1
-        self.freq_range_region.setRegion([f1, f2])
-        self.frequency_range_selected.emit(f1, f2)
-    
-    def _on_f2_marker_moved(self):
-        """Handle f2 marker movement."""
-        f1 = self.f1_marker.value()
-        f2 = self.f2_marker.value()
-        
-        # Ensure f2 > f1
-        if f2 <= f1:
-            f2 = f1 + 1e6  # 1 MHz minimum difference
-            self.f2_marker.setPos(f2)
-        
-        self.f2_frequency = f2
-        self.freq_range_region.setRegion([f1, f2])
-        self.frequency_range_selected.emit(f1, f2)
-    
     def _on_frequency_region_changed(self):
         """Handle frequency region change."""
         f1, f2 = self.freq_range_region.getRegion()
         
         self.f1_frequency = f1
         self.f2_frequency = f2
-        
-        self.f1_marker.setPos(f1)
-        self.f2_marker.setPos(f2)
         
         self.frequency_range_selected.emit(f1, f2)
     
@@ -522,3 +555,95 @@ class SpectrumWidget(QWidget):
         self.set_frequency_range(f1, f2)
         if not self.markers_enabled:
             self.set_frequency_markers_enabled(True)
+    
+    def get_frequency_range_data(self):
+        """Get spectrum data within the frequency range region for analysis."""
+        if not self.markers_enabled or len(self.spectrum_data) == 0 or len(self.frequency_axis) == 0:
+            return None, None, None
+        
+        f1, f2 = self.freq_range_region.getRegion()
+        
+        # Ensure f1 < f2
+        if f1 > f2:
+            f1, f2 = f2, f1
+        
+        # Find indices within the frequency range
+        mask = (self.frequency_axis >= f1) & (self.frequency_axis <= f2)
+        
+        if not np.any(mask):
+            return None, None, None
+        
+        # Extract data within range
+        freq_range = self.frequency_axis[mask]
+        power_range = self.spectrum_data[mask]
+        
+        # Calculate range statistics
+        range_stats = {
+            'center_freq': (f1 + f2) / 2,
+            'bandwidth': f2 - f1,
+            'freq_start': f1,
+            'freq_end': f2,
+            'peak_power': np.max(power_range),
+            'avg_power': np.mean(power_range),
+            'peak_freq': freq_range[np.argmax(power_range)],
+            'num_samples': len(freq_range),
+            'snr_estimate': self._estimate_snr(power_range),
+            'signal_present': self._detect_signal_presence(power_range)
+        }
+        
+        return freq_range, power_range, range_stats
+    
+    def _estimate_snr(self, power_data):
+        """Estimate Signal-to-Noise Ratio from power data."""
+        if len(power_data) == 0:
+            return None
+        
+        try:
+            # Simple SNR estimation: (peak - median) as signal, std as noise
+            peak_power = np.max(power_data)
+            noise_floor = np.median(power_data)
+            noise_std = np.std(power_data)
+            
+            # SNR = (Signal - Noise) / Noise_std
+            snr_db = (peak_power - noise_floor) / max(noise_std, 0.1)
+            return float(snr_db)
+        except:
+            return None
+    
+    def _detect_signal_presence(self, power_data):
+        """Detect if there's a significant signal in the power data."""
+        if len(power_data) == 0:
+            return False
+        
+        try:
+            # Check if peak power is significantly above noise floor
+            peak_power = np.max(power_data)
+            noise_floor = np.median(power_data)
+            threshold = 10.0  # 10 dB above noise floor
+            
+            return (peak_power - noise_floor) > threshold
+        except:
+            return False
+    
+    def request_signal_analysis(self):
+        """Request detailed signal analysis for the selected frequency range."""
+        freq_data, power_data, stats = self.get_frequency_range_data()
+        
+        if freq_data is None or not stats['signal_present']:
+            return None
+        
+        # Emit signal to request IQ data analysis
+        analysis_request = {
+            'center_freq': stats['center_freq'],
+            'bandwidth': stats['bandwidth'],
+            'freq_range': (stats['freq_start'], stats['freq_end']),
+            'power_stats': stats,
+            'analysis_type': 'full',  # modulation, coding, demodulation
+            'timestamp': np.datetime64('now')
+        }
+        
+        # This will be connected to the main app for full signal processing
+        if hasattr(self, 'signal_analysis_requested'):
+            self.signal_analysis_requested.emit(analysis_request)
+        
+        return analysis_request

@@ -14,6 +14,7 @@ from PySide6.QtGui import QCloseEvent
 from rf_spectrum_analyzer.gui.main_window import MainWindow
 from rf_spectrum_analyzer.core.sdr_backend import SDRBackendManager
 from rf_spectrum_analyzer.core.signal_processor import SignalProcessor
+from rf_spectrum_analyzer.dsp.signal_analysis import SignalAnalyzer
 from rf_spectrum_analyzer.config.settings import Settings
 from rf_spectrum_analyzer.utils.logger import get_logger
 
@@ -34,10 +35,12 @@ class DataAcquisitionThread(QThread):
         self.buffer_size = settings.dsp.fft_size * 2  # Double buffer for overlap
     
     def run(self):
-        """Main acquisition loop."""
+        """Main acquisition loop with robust error handling."""
         try:
             logger.info("Starting data acquisition thread")
             self.running = True
+            connection_errors = 0
+            max_connection_errors = 5
             
             while self.running:
                 if self.sdr_manager.is_connected():
@@ -45,7 +48,16 @@ class DataAcquisitionThread(QThread):
                     samples = self.sdr_manager.read_samples(self.buffer_size)
                     if samples is not None and len(samples) > 0:
                         self.data_ready.emit(samples)
+                        connection_errors = 0  # Reset error counter on successful read
                     else:
+                        connection_errors += 1
+                        if connection_errors >= max_connection_errors:
+                            logger.warning(f"No data received for {connection_errors} consecutive attempts. Checking connection health...")
+                            # Check if backend has health check method
+                            if hasattr(self.sdr_manager.backend, 'is_connection_healthy'):
+                                if not self.sdr_manager.backend.is_connection_healthy():
+                                    logger.warning("Connection unhealthy, backend will attempt reconnection on next read")
+                            connection_errors = 0  # Reset counter
                         self.msleep(10)  # Brief pause if no data available
                 else:
                     self.msleep(100)  # Wait longer if not connected
@@ -73,6 +85,7 @@ class RFSpectrumAnalyzerApp(QObject):
         # Core components
         self.sdr_manager = None
         self.signal_processor = None
+        self.signal_analyzer = None
         self.main_window = None
         self.acquisition_thread = None
         
@@ -111,6 +124,9 @@ class RFSpectrumAnalyzerApp(QObject):
             
             # Initialize signal processor
             self.signal_processor = SignalProcessor(self.settings)
+            
+            # Initialize signal analyzer
+            self.signal_analyzer = SignalAnalyzer(self.settings.sdr.sample_rate)
             
             # Initialize SDR backend manager
             self.sdr_manager = SDRBackendManager(self.settings)
@@ -232,6 +248,10 @@ class RFSpectrumAnalyzerApp(QObject):
             self.main_window.tdma_detection_triggered.connect(self.trigger_tdma_detection)
             self.main_window.auto_detection_toggled.connect(self.toggle_auto_detection)
             self.main_window.advanced_analysis_toggled.connect(self.toggle_advanced_analysis)
+            
+            # Connect signal analysis signals
+            if hasattr(self.main_window.spectrum_widget, 'signal_analysis_requested'):
+                self.main_window.spectrum_widget.signal_analysis_requested.connect(self.handle_signal_analysis_request)
             self.main_window.detection_threshold_changed.connect(self.change_detection_threshold)
             self.main_window.detection_interval_changed.connect(self.change_detection_interval)
             
@@ -891,8 +911,16 @@ class RFSpectrumAnalyzerApp(QObject):
             noise = (np.random.randn(num_samples) + 1j*np.random.randn(num_samples)) * noise_power
             signal += noise
             
-            # Normalize
-            signal = signal / np.max(np.abs(signal))
+            # Normalize safely
+            max_amplitude = np.max(np.abs(signal))
+            if max_amplitude > 1e-10:  # Avoid division by zero
+                signal = signal / max_amplitude
+            else:
+                # If signal is essentially zero, create a small random signal
+                signal = 0.01 * (np.random.randn(num_samples) + 1j*np.random.randn(num_samples))
+            
+            # Ensure finite values
+            signal = np.nan_to_num(signal, nan=0.0, posinf=1.0, neginf=-1.0)
             
             # Send to processing pipeline
             self.on_new_data(signal.astype(np.complex64))
@@ -959,6 +987,212 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.logger.info(f"Advanced analysis {'enabled' if enabled else 'disabled'}")
         except Exception as e:
             self.logger.error(f"Error toggling advanced analysis: {e}")
+    
+    def handle_signal_analysis_request(self, analysis_request: Dict[str, Any]):
+        """Handle signal analysis request from spectrum widget."""
+        try:
+            self.logger.info(f"Processing signal analysis request for {analysis_request['center_freq']/1e6:.3f} MHz")
+            
+            # Get IQ data for the specified frequency range
+            iq_data = self._get_iq_data_for_range(
+                analysis_request['center_freq'],
+                analysis_request['bandwidth']
+            )
+            
+            if iq_data is None or len(iq_data) == 0:
+                self.logger.warning("No IQ data available for analysis")
+                return
+            
+            # Perform comprehensive signal analysis
+            if self.signal_analyzer:
+                analysis_results = self.signal_analyzer.analyze_signal_comprehensive(
+                    iq_data,
+                    analysis_request['center_freq'],
+                    analysis_request['bandwidth']
+                )
+                
+                # Update GUI with analysis results
+                self._update_gui_with_analysis_results(analysis_results)
+                
+                self.logger.info(f"Signal analysis completed: {analysis_results.get('modulation', {}).get('type', 'Unknown')} detected")
+            else:
+                self.logger.error("Signal analyzer not initialized")
+                
+        except Exception as e:
+            self.logger.error(f"Error handling signal analysis request: {e}")
+    
+    def _get_iq_data_for_range(self, center_freq: float, bandwidth: float) -> Optional[np.ndarray]:
+        """Get IQ data for specific frequency range."""
+        try:
+            if self.demo_mode:
+                # Generate synthetic IQ data for demo
+                return self._generate_demo_iq_data(center_freq, bandwidth)
+            
+            # For real SDR, we would need to tune to the frequency and capture data
+            if self.sdr_manager and self.sdr_manager.is_connected():
+                # Store current settings
+                original_freq = self.settings.sdr.center_frequency
+                
+                try:
+                    # Tune to target frequency
+                    self.sdr_manager.set_frequency(center_freq)
+                    
+                    # Capture IQ samples
+                    num_samples = int(self.settings.sdr.sample_rate * 0.1)  # 100ms of data
+                    iq_data = self.sdr_manager.read_samples(num_samples)
+                    
+                    # Restore original frequency
+                    self.sdr_manager.set_frequency(original_freq)
+                    
+                    return iq_data
+                    
+                except Exception as e:
+                    self.logger.error(f"Error capturing IQ data: {e}")
+                    # Restore frequency on error
+                    try:
+                        self.sdr_manager.set_frequency(original_freq)
+                    except:
+                        pass
+                    return None
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error getting IQ data for range: {e}")
+            return None
+    
+    def _generate_demo_iq_data(self, center_freq: float, bandwidth: float) -> np.ndarray:
+        """Generate synthetic IQ data for demo mode."""
+        try:
+            duration = 0.1  # 100ms
+            sample_rate = self.settings.sdr.sample_rate
+            num_samples = int(sample_rate * duration)
+            
+            # Generate time array
+            t = np.linspace(0, duration, num_samples)
+            
+            # Generate different modulation types based on frequency
+            freq_mhz = center_freq / 1e6
+            
+            if 100 <= freq_mhz <= 200:
+                # Generate BPSK signal
+                symbol_rate = 1000  # 1 kHz symbol rate
+                data_bits = np.random.randint(0, 2, int(duration * symbol_rate))
+                symbols = 2 * data_bits - 1  # Convert to +1/-1
+                
+                # Upsample symbols
+                samples_per_symbol = int(sample_rate / symbol_rate)
+                upsampled = np.repeat(symbols, samples_per_symbol)[:num_samples]
+                
+                # Add carrier and noise
+                carrier_freq = 1000  # 1 kHz offset
+                iq_data = upsampled * np.exp(1j * 2 * np.pi * carrier_freq * t)
+                
+            elif 200 <= freq_mhz <= 300:
+                # Generate QPSK signal
+                symbol_rate = 500
+                data_bits = np.random.randint(0, 4, int(duration * symbol_rate))
+                
+                # Map to QPSK constellation
+                symbols = np.exp(1j * np.pi * data_bits / 2)
+                
+                # Upsample
+                samples_per_symbol = int(sample_rate / symbol_rate)
+                upsampled = np.repeat(symbols, samples_per_symbol)[:num_samples]
+                
+                # Add carrier
+                carrier_freq = 2000
+                iq_data = upsampled * np.exp(1j * 2 * np.pi * carrier_freq * t)
+                
+            elif 400 <= freq_mhz <= 500:
+                # Generate FSK signal
+                symbol_rate = 1200
+                data_bits = np.random.randint(0, 2, int(duration * symbol_rate))
+                
+                # FSK frequencies
+                freq_0 = 1000  # Frequency for bit 0
+                freq_1 = 2000  # Frequency for bit 1
+                
+                samples_per_symbol = int(sample_rate / symbol_rate)
+                iq_data = np.zeros(num_samples, dtype=complex)
+                
+                for i, bit in enumerate(data_bits):
+                    start_idx = i * samples_per_symbol
+                    end_idx = min(start_idx + samples_per_symbol, num_samples)
+                    
+                    if end_idx <= start_idx:
+                        break
+                        
+                    freq = freq_1 if bit else freq_0
+                    t_symbol = t[start_idx:end_idx]
+                    iq_data[start_idx:end_idx] = np.exp(1j * 2 * np.pi * freq * t_symbol)
+                    
+            else:
+                # Generate white noise
+                iq_data = (np.random.randn(num_samples) + 1j * np.random.randn(num_samples)) / np.sqrt(2)
+            
+            # Add noise
+            noise_power = 0.1
+            noise = (np.random.randn(num_samples) + 1j * np.random.randn(num_samples)) * np.sqrt(noise_power / 2)
+            iq_data += noise
+            
+            return iq_data.astype(np.complex64)
+            
+        except Exception as e:
+            self.logger.error(f"Error generating demo IQ data: {e}")
+            # Return white noise as fallback
+            num_samples = int(self.settings.sdr.sample_rate * 0.1)
+            return (np.random.randn(num_samples) + 1j * np.random.randn(num_samples)).astype(np.complex64)
+    
+    def _update_gui_with_analysis_results(self, analysis_results: Dict[str, Any]):
+        """Update GUI components with signal analysis results."""
+        try:
+            if not self.main_window:
+                return
+            
+            # Update constellation widget
+            if 'constellation_data' in analysis_results and analysis_results['constellation_data']['points']:
+                constellation_points = np.array(analysis_results['constellation_data']['points'])
+                if len(constellation_points) > 0:
+                    # Extract modulation info for the widget
+                    modulation_info = {
+                        'type': analysis_results['modulation']['type'],
+                        'confidence': analysis_results['modulation']['confidence']
+                    }
+                    self.main_window.constellation_widget.update_constellation(
+                        constellation_points,
+                        None,  # symbols (optional)
+                        modulation_info
+                    )
+            
+            # Update bitstream widget
+            if analysis_results['demodulation']['success'] and 'coding' in analysis_results and analysis_results['coding']:
+                if analysis_results['coding']['decoded_bits'] is not None:
+                    decoded_bits = np.array(analysis_results['coding']['decoded_bits'])
+                    # Convert to list of integers for the widget
+                    if decoded_bits.dtype == bool:
+                        bits = decoded_bits.astype(int).tolist()
+                    else:
+                        bits = np.clip(decoded_bits, 0, 1).astype(int).tolist()
+                    self.main_window.bitstream_widget.add_bits(bits)
+            
+            # Update info display
+            info_text = f"Modulation: {analysis_results['modulation']['type']} " \
+                       f"(Confidence: {analysis_results['modulation']['confidence']:.2f})"
+            
+            if analysis_results['demodulation']['snr'] is not None:
+                info_text += f", SNR: {analysis_results['demodulation']['snr']:.1f} dB"
+            
+            if 'coding' in analysis_results and analysis_results['coding']:
+                info_text += f", Coding: {analysis_results['coding']['coding_type']}"
+            
+            # Display in spectrum widget info label
+            self.main_window.spectrum_widget.info_label.setText(info_text)
+            
+            self.logger.info(f"GUI updated with analysis results: {info_text}")
+            
+        except Exception as e:
+            self.logger.error(f"Error updating GUI with analysis results: {e}")
     
     def change_detection_threshold(self, threshold_dbm):
         """Change signal detection threshold."""

@@ -49,6 +49,7 @@ class DemodulationEngine:
             "PSK": PSKDemodulator(self.sample_rate),
             "BPSK": PSKDemodulator(self.sample_rate),  # BPSK is the same as PSK
             "QPSK": QPSKDemodulator(self.sample_rate),
+            "PSK8": PSK8Demodulator(self.sample_rate),  # Add PSK8 mapping
             "8PSK": PSK8Demodulator(self.sample_rate),
             "QAM16": QAM16Demodulator(self.sample_rate),
             "QAM64": QAM64Demodulator(self.sample_rate),
