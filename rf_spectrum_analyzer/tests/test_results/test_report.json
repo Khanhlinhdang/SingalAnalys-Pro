@@ -1,0 +1,29 @@
+{
+  "timestamp": 1757979094.1359725,
+  "overall_result": false,
+  "total_duration": 2.908918619155884,
+  "summary": {
+    "total_tests": 36,
+    "total_failures": 0,
+    "total_errors": 27,
+    "total_skipped": 0,
+    "passed_modules": 0,
+    "total_modules": 1
+  },
+  "modules": {
+    "dsp_modulation": {
+      "tests_run": 36,
+      "failures": 0,
+      "errors": 27,
+      "skipped": 0,
+      "duration": 0.09802055358886719,
+      "success": false
+    }
+  },
+  "config": {
+    "coverage": false,
+    "performance": false,
+    "debug": false,
+    "ci_mode": false
+  }
+}
