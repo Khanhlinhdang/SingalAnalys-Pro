@@ -69,6 +69,23 @@ class ControlsWidget(QWidget):
     # SpyServer specific signals
     spyserver_config_changed = Signal(dict)
     
+    # Frequency analysis signals
+    frequency_range_changed = Signal(float, float)  # f1, f2
+    frequency_markers_toggled = Signal(bool)
+    center_frequency_locked = Signal(bool)
+    analysis_bandwidth_changed = Signal(float)
+    
+    # New sequential workflow signals
+    demodulate_triggered = Signal()  # Step 2: Demodulate button clicked
+    decode_triggered = Signal()     # Step 3: Decode button clicked
+    capture_ready = Signal(bool)    # Capture status changed
+    
+    # Frequency analysis signals
+    frequency_range_changed = Signal(float, float)  # f1, f2
+    frequency_markers_toggled = Signal(bool)
+    center_frequency_locked = Signal(bool)
+    analysis_bandwidth_changed = Signal(float)
+    
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.settings = settings
@@ -100,6 +117,7 @@ class ControlsWidget(QWidget):
         self.create_device_tab()
         self.create_processing_tab()
         self.create_detection_tab()
+        self.create_frequency_analysis_tab()  # New tab for frequency analysis
         self.create_display_tab()
         
         # Add stretch to push everything to top
@@ -206,12 +224,17 @@ class ControlsWidget(QWidget):
         self.spyserver_group = QGroupBox("SpyServer Configuration")
         spyserver_layout = QFormLayout(self.spyserver_group)
         
+        # Server info label
+        server_info_label = QLabel("Default: RomanPort Airspy Mini (24 MHz - 1.8 GHz)")
+        server_info_label.setStyleSheet("QLabel { color: #2E8B57; font-weight: bold; font-size: 10px; }")
+        spyserver_layout.addRow("", server_info_label)
+        
         # Host and port
         connection_layout = QHBoxLayout()
-        self.spyserver_host_input = QLineEdit("localhost")
+        self.spyserver_host_input = QLineEdit("64.31.248.40")
         self.spyserver_port_input = QSpinBox()
         self.spyserver_port_input.setRange(1, 65535)
-        self.spyserver_port_input.setValue(5555)
+        self.spyserver_port_input.setValue(63863)
         connection_layout.addWidget(self.spyserver_host_input)
         connection_layout.addWidget(QLabel(":"))
         connection_layout.addWidget(self.spyserver_port_input)
@@ -220,9 +243,14 @@ class ControlsWidget(QWidget):
         # Timeout
         self.spyserver_timeout_spinbox = QDoubleSpinBox()
         self.spyserver_timeout_spinbox.setRange(1.0, 60.0)
-        self.spyserver_timeout_spinbox.setValue(10.0)
+        self.spyserver_timeout_spinbox.setValue(15.0)
         self.spyserver_timeout_spinbox.setSuffix(" s")
         spyserver_layout.addRow("Timeout:", self.spyserver_timeout_spinbox)
+        
+        # Device capabilities label
+        capabilities_label = QLabel("• Max Sample Rate: 3.0 MSPS\n• Resolution: 12-bit\n• Gain Stages: 22 levels")
+        capabilities_label.setStyleSheet("QLabel { color: #4169E1; font-size: 9px; }")
+        spyserver_layout.addRow("Capabilities:", capabilities_label)
         
         # Connection test button
         self.spyserver_test_button = QPushButton("Test Connection")
@@ -528,6 +556,161 @@ class ControlsWidget(QWidget):
         
         self.tab_widget.addTab(display_widget, "Display")
     
+    def create_frequency_analysis_tab(self):
+        """Create frequency analysis tab with new sequential workflow."""
+        analysis_widget = QWidget()
+        layout = QVBoxLayout(analysis_widget)
+        
+        # Frequency Range Selection Group
+        range_group = QGroupBox("2MHz Bandwidth Capture (f1-f2)")
+        range_layout = QFormLayout(range_group)
+        
+        # Enable frequency range selection
+        self.freq_range_enabled = QCheckBox("Enable 2MHz Bandwidth Capture")
+        self.freq_range_enabled.stateChanged.connect(self._on_frequency_range_toggle)
+        range_layout.addRow(self.freq_range_enabled)
+        
+        # Start frequency (f1)
+        self.freq_start_spinbox = QDoubleSpinBox()
+        self.freq_start_spinbox.setDecimals(3)
+        self.freq_start_spinbox.setRange(0.001, 6000.0)  # 1 kHz to 6 GHz
+        self.freq_start_spinbox.setValue(432.0)  # 432 MHz default
+        self.freq_start_spinbox.setSuffix(" MHz")
+        self.freq_start_spinbox.setSingleStep(1.0)
+        self.freq_start_spinbox.valueChanged.connect(self._on_frequency_range_changed)
+        range_layout.addRow("Start Frequency (f1):", self.freq_start_spinbox)
+        
+        # End frequency (f2) - automatically set to f1 + 2MHz
+        self.freq_end_spinbox = QDoubleSpinBox()
+        self.freq_end_spinbox.setDecimals(3)
+        self.freq_end_spinbox.setRange(0.001, 6000.0)  # 1 kHz to 6 GHz
+        self.freq_end_spinbox.setValue(434.0)  # f1 + 2MHz default
+        self.freq_end_spinbox.setSuffix(" MHz")
+        self.freq_end_spinbox.setSingleStep(1.0)
+        self.freq_end_spinbox.valueChanged.connect(self._on_frequency_range_changed)
+        range_layout.addRow("End Frequency (f2):", self.freq_end_spinbox)
+        
+        # Fixed 2MHz bandwidth display
+        self.bandwidth_label = QLabel("2.000 MHz")
+        self.bandwidth_label.setStyleSheet("font-weight: bold; color: #FF9800;")
+        range_layout.addRow("Capture Bandwidth:", self.bandwidth_label)
+        
+        layout.addWidget(range_group)
+        
+        # Spectrum Markers Group
+        markers_group = QGroupBox("Interactive Frequency Markers")
+        markers_layout = QFormLayout(markers_group)
+        
+        # Show frequency markers
+        self.show_freq_markers = QCheckBox("Show f1/f2 Horizontal Lines")
+        self.show_freq_markers.setChecked(True)
+        self.show_freq_markers.stateChanged.connect(self._on_frequency_markers_toggle)
+        markers_layout.addRow(self.show_freq_markers)
+        
+        # Lock center frequency
+        self.lock_center_freq = QCheckBox("Lock Center Frequency")
+        self.lock_center_freq.stateChanged.connect(self._on_center_frequency_lock)
+        markers_layout.addRow(self.lock_center_freq)
+        
+        # Current center frequency display
+        self.current_center_label = QLabel("433.000 MHz")
+        self.current_center_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
+        markers_layout.addRow("Current Center:", self.current_center_label)
+        
+        # Current span display
+        self.current_span_label = QLabel("2.000 MHz")
+        self.current_span_label.setStyleSheet("font-weight: bold; color: #2196F3;")
+        markers_layout.addRow("Current Span:", self.current_span_label)
+        
+        layout.addWidget(markers_group)
+        
+        # Sequential Processing Workflow
+        workflow_group = QGroupBox("Sequential Processing Workflow")
+        workflow_layout = QVBoxLayout(workflow_group)
+        
+        # Step 1: Capture
+        capture_layout = QHBoxLayout()
+        self.capture_status_label = QLabel("Step 1: Ready to capture 2MHz bandwidth")
+        self.capture_status_label.setStyleSheet("font-weight: bold; color: #757575;")
+        capture_layout.addWidget(self.capture_status_label)
+        capture_layout.addStretch()
+        workflow_layout.addLayout(capture_layout)
+        
+        # Step 2: Demodulation
+        demod_layout = QHBoxLayout()
+        self.demod_button = QPushButton("Step 2: DEMODULATE")
+        self.demod_button.setEnabled(False)
+        self.demod_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }
+            QPushButton:disabled {
+                background-color: #CCCCCC;
+                color: #666666;
+            }
+            QPushButton:hover:enabled {
+                background-color: #1976D2;
+            }
+        """)
+        self.demod_button.clicked.connect(self._on_demodulate_clicked)
+        demod_layout.addWidget(self.demod_button)
+        
+        self.demod_status_label = QLabel("Detect and demodulate signal")
+        self.demod_status_label.setStyleSheet("color: #757575;")
+        demod_layout.addWidget(self.demod_status_label)
+        demod_layout.addStretch()
+        
+        self.detected_modulation_label = QLabel("")
+        self.detected_modulation_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
+        demod_layout.addWidget(self.detected_modulation_label)
+        
+        workflow_layout.addLayout(demod_layout)
+        
+        # Step 3: Decoding
+        decode_layout = QHBoxLayout()
+        self.decode_button = QPushButton("Step 3: DECODE")
+        self.decode_button.setEnabled(False)
+        self.decode_button.setStyleSheet("""
+            QPushButton {
+                background-color: #FF5722;
+                color: white;
+                font-weight: bold;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }
+            QPushButton:disabled {
+                background-color: #CCCCCC;
+                color: #666666;
+            }
+            QPushButton:hover:enabled {
+                background-color: #E64A19;
+            }
+        """)
+        self.decode_button.clicked.connect(self._on_decode_clicked)
+        decode_layout.addWidget(self.decode_button)
+        
+        self.decode_status_label = QLabel("Detect encoding and decode data")
+        self.decode_status_label.setStyleSheet("color: #757575;")
+        decode_layout.addWidget(self.decode_status_label)
+        decode_layout.addStretch()
+        
+        self.detected_encoding_label = QLabel("")
+        self.detected_encoding_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
+        decode_layout.addWidget(self.detected_encoding_label)
+        
+        workflow_layout.addLayout(decode_layout)
+        
+        layout.addWidget(workflow_group)
+        
+        # Initially disable frequency range controls
+        self._update_frequency_range_controls()
+        
+        self.tab_widget.addTab(analysis_widget, "Sequential Analysis")
+    
     def create_control_buttons(self, layout):
         """Create start/stop control buttons."""
         button_layout = QHBoxLayout()
@@ -581,8 +764,26 @@ class ControlsWidget(QWidget):
         # Initialize status indicators
         self.update_status("Ready")
         self.update_fps(0)
+        
+        # Initialize frequency analysis settings
+        if hasattr(self, 'freq_range_enabled'):
+            self.freq_range_enabled.setChecked(False)
+            self.show_freq_markers.setChecked(True)
+            self.lock_center_freq.setChecked(False)
+            # self.realtime_spectrum.setChecked(True)  # Widget removed in sequential workflow
+            # self.peak_hold_enabled.setChecked(False)  # Widget removed in sequential workflow
+            self._update_frequency_range_controls()
         self.update_device_status(self.settings.sdr.device_type, False)
         self.update_frequency_display(self.settings.sdr.center_frequency)
+        
+        # Load SpyServer settings
+        self.spyserver_host_input.setText(self.settings.sdr.spyserver_host)
+        self.spyserver_port_input.setValue(self.settings.sdr.spyserver_port)
+        self.spyserver_timeout_spinbox.setValue(self.settings.sdr.spyserver_timeout)
+        
+        # Update device type visibility  
+        # Force trigger to ensure SpyServer controls are shown correctly
+        self._on_device_type_changed(self.settings.sdr.device_type)
         
         # Load detection settings if available
         if hasattr(self.settings, 'detection'):
@@ -886,3 +1087,177 @@ class ControlsWidget(QWidget):
     def update_frequency_display(self, frequency: float):
         """Update the frequency display."""
         self.frequency_label.setText(f"Freq: {frequency/1e6:.3f} MHz")
+        
+        # Update current center frequency display in frequency analysis tab
+        if hasattr(self, 'current_center_label'):
+            self.current_center_label.setText(f"{frequency/1e6:.3f} MHz")
+    
+    # Frequency Analysis Tab Callbacks
+    def _on_frequency_range_toggle(self, state):
+        """Handle frequency range analysis toggle."""
+        enabled = state == Qt.Checked
+        self._update_frequency_range_controls()
+        
+        if enabled:
+            # Emit initial frequency range
+            f1 = self.freq_start_spinbox.value() * 1e6  # Convert MHz to Hz
+            f2 = self.freq_end_spinbox.value() * 1e6
+            self.frequency_range_changed.emit(f1, f2)
+    
+    def _update_frequency_range_controls(self):
+        """Update the enabled state of frequency range controls."""
+        enabled = self.freq_range_enabled.isChecked()
+        self.freq_start_spinbox.setEnabled(enabled)
+        self.freq_end_spinbox.setEnabled(enabled)
+        self.lock_center_freq.setEnabled(enabled)
+    
+    def _on_frequency_range_changed(self):
+        """Handle frequency range change - automatically maintain 2MHz bandwidth."""
+        if self.freq_range_enabled.isChecked():
+            # Get current f1 value
+            f1 = self.freq_start_spinbox.value()  # MHz
+            
+            # Automatically set f2 to f1 + 2MHz
+            f2 = f1 + 2.0
+            
+            # Temporarily disconnect signals to avoid recursion
+            self.freq_end_spinbox.valueChanged.disconnect(self._on_frequency_range_changed)
+            self.freq_end_spinbox.setValue(f2)
+            self.freq_end_spinbox.valueChanged.connect(self._on_frequency_range_changed)
+            
+            # Convert to Hz and emit signal
+            f1_hz = f1 * 1e6
+            f2_hz = f2 * 1e6
+            self.frequency_range_changed.emit(f1_hz, f2_hz)
+            
+            # Update bandwidth display
+            self.bandwidth_label.setText("2.000 MHz")
+            
+            # Update center frequency if locked
+            if self.lock_center_freq.isChecked():
+                center_freq = (f1 + f2) / 2
+                # Update the frequency input field
+                if hasattr(self, 'frequency_input'):
+                    self.frequency_input.setText(f"{center_freq:.3f}")
+                    self.frequency_changed.emit(center_freq * 1e6)  # Convert to Hz
+            
+            # Update current center display
+            if hasattr(self, 'current_center_label'):
+                center_freq = (f1 + f2) / 2
+                self.current_center_label.setText(f"{center_freq:.3f} MHz")
+    
+    def _on_frequency_markers_toggle(self, state):
+        """Handle frequency markers toggle."""
+        enabled = state == Qt.Checked
+        self.frequency_markers_toggled.emit(enabled)
+    
+    def _on_center_frequency_lock(self, state):
+        """Handle center frequency lock toggle."""
+        locked = state == Qt.Checked
+        self.center_frequency_locked.emit(locked)
+        
+        if locked:
+            # Automatically set center frequency to middle of range
+            f1 = self.freq_start_spinbox.value() * 1e6
+            f2 = self.freq_end_spinbox.value() * 1e6
+            center_freq = (f1 + f2) / 2
+            self.frequency_spinbox.setValue(center_freq / 1e6)
+    
+    def update_frequency_range_from_spectrum(self, f1: float, f2: float):
+        """Update frequency range controls from spectrum widget interaction."""
+        self.freq_start_spinbox.setValue(f1 / 1e6)  # Convert Hz to MHz
+        self.freq_end_spinbox.setValue(f2 / 1e6)
+        
+        # Automatically adjust f2 to maintain 2MHz bandwidth
+        self._enforce_2mhz_bandwidth()
+    
+    def _enforce_2mhz_bandwidth(self):
+        """Enforce 2MHz bandwidth between f1 and f2."""
+        f1 = self.freq_start_spinbox.value()
+        f2 = f1 + 2.0  # Always 2MHz bandwidth
+        self.freq_end_spinbox.setValue(f2)
+        
+        # Update bandwidth display
+        self.bandwidth_label.setText("2.000 MHz")
+        
+        # Update span display
+        if hasattr(self, 'current_span_label'):
+            self.current_span_label.setText("2.000 MHz")
+    
+    # Sequential Workflow Callbacks
+    def _on_demodulate_clicked(self):
+        """Handle demodulate button click."""
+        self.demod_button.setEnabled(False)
+        self.demod_status_label.setText("Processing...")
+        self.demod_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+        
+        # Emit signal to start demodulation
+        self.demodulate_triggered.emit()
+    
+    def _on_decode_clicked(self):
+        """Handle decode button click."""
+        self.decode_button.setEnabled(False)
+        self.decode_status_label.setText("Processing...")
+        self.decode_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+        
+        # Emit signal to start decoding
+        self.decode_triggered.emit()
+    
+    def update_capture_status(self, ready: bool):
+        """Update capture status and enable/disable demodulate button."""
+        if ready:
+            self.capture_status_label.setText("Step 1: ✓ 2MHz bandwidth captured")
+            self.capture_status_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
+            self.demod_button.setEnabled(True)
+            self.capture_ready.emit(True)
+        else:
+            self.capture_status_label.setText("Step 1: Ready to capture 2MHz bandwidth")
+            self.capture_status_label.setStyleSheet("font-weight: bold; color: #757575;")
+            self.demod_button.setEnabled(False)
+            self.decode_button.setEnabled(False)
+            self.capture_ready.emit(False)
+            
+            # Reset workflow status
+            self.reset_workflow_status()
+    
+    def update_demodulation_result(self, success: bool, modulation_type: str = ""):
+        """Update demodulation result and enable/disable decode button."""
+        if success and modulation_type:
+            self.demod_status_label.setText("✓ Completed")
+            self.demod_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.detected_modulation_label.setText(f"Found: {modulation_type}")
+            self.decode_button.setEnabled(True)
+        else:
+            self.demod_status_label.setText("✗ Failed or no signal detected")
+            self.demod_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            self.detected_modulation_label.setText("")
+            self.decode_button.setEnabled(False)
+        
+        # Re-enable demodulate button for retry
+        self.demod_button.setEnabled(True)
+    
+    def update_decoding_result(self, success: bool, encoding_type: str = ""):
+        """Update decoding result."""
+        if success and encoding_type:
+            self.decode_status_label.setText("✓ Completed")
+            self.decode_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.detected_encoding_label.setText(f"Found: {encoding_type}")
+        else:
+            self.decode_status_label.setText("✗ Failed or no encoding detected")
+            self.decode_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            self.detected_encoding_label.setText("")
+        
+        # Re-enable decode button for retry
+        self.decode_button.setEnabled(True)
+    
+    def reset_workflow_status(self):
+        """Reset all workflow status to initial state."""
+        # Reset demodulation status
+        self.demod_status_label.setText("Detect and demodulate signal")
+        self.demod_status_label.setStyleSheet("color: #757575;")
+        self.detected_modulation_label.setText("")
+        
+        # Reset decoding status
+        self.decode_status_label.setText("Detect encoding and decode data")
+        self.decode_status_label.setStyleSheet("color: #757575;")
+        self.detected_encoding_label.setText("")

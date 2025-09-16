@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SDRSettings:
     """SDR device configuration settings."""
-    device_type: str = "rtlsdr"  # rtlsdr, hackrf, pluto, soapy, usrp, spyserver
+    device_type: str = "spyserver"  # rtlsdr, hackrf, pluto, soapy, usrp, spyserver
     center_frequency: float = 100e6  # Hz
-    sample_rate: float = 2e6  # Hz
+    sample_rate: float = 2.4e6  # Hz (SpyServer optimized)
     gain: float = 20.0  # dB
-    bandwidth: float = 2e6  # Hz
+    bandwidth: float = 2.4e6  # Hz (SpyServer max bandwidth)
     antenna: str = "RX"
     ppm_error: int = 0
     bias_tee: bool = False
@@ -38,9 +38,9 @@ class SDRSettings:
     pluto_buffer_size: int = 1024
     
     # SpyServer specific parameters
-    spyserver_host: str = "localhost"
-    spyserver_port: int = 5555
-    spyserver_timeout: float = 10.0
+    spyserver_host: str = "64.31.248.40"
+    spyserver_port: int = 63863
+    spyserver_timeout: float = 15.0
     
     def to_sdrconfig(self) -> Optional['SDRConfig']:
         """Convert to sdrconnect SDRConfig format."""

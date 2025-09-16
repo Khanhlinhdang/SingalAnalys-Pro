@@ -115,6 +115,10 @@ class RFSpectrumAnalyzerApp(QObject):
             # Initialize SDR backend manager
             self.sdr_manager = SDRBackendManager(self.settings)
             
+            # Check demo mode setting
+            self.logger.info(f"Demo mode from settings: {getattr(self.settings, 'demo_mode', False)}")
+            self.logger.info(f"Demo mode instance variable: {self.demo_mode}")
+            
             # Try to connect to SDR device - if fails, enable demo mode
             self._try_sdr_connection()
             
@@ -154,9 +158,17 @@ class RFSpectrumAnalyzerApp(QObject):
             device_type = self.settings.sdr.device_type
             self.logger.info(f"Attempting to connect to {device_type} device...")
             
-            if self.sdr_manager.connect():
+            # Check if demo mode was explicitly requested
+            demo_requested = getattr(self.settings, 'demo_mode', False)
+            
+            if demo_requested:
+                self.logger.info("Demo mode explicitly requested - skipping SDR connection")
+                self._enable_demo_mode()
+            elif self.sdr_manager.connect():
                 self.logger.info(f"Successfully connected to {device_type}")
-                self.demo_mode = False
+                # Only disable demo mode if it wasn't explicitly requested
+                if not demo_requested:
+                    self.demo_mode = False
             else:
                 self.logger.warning(f"Failed to connect to {device_type}, enabling demo mode")
                 self._enable_demo_mode()
@@ -213,6 +225,15 @@ class RFSpectrumAnalyzerApp(QObject):
             self.main_window.advanced_analysis_toggled.connect(self.toggle_advanced_analysis)
             self.main_window.detection_threshold_changed.connect(self.change_detection_threshold)
             self.main_window.detection_interval_changed.connect(self.change_detection_interval)
+            
+            # Connect frequency analysis signals
+            self.main_window.frequency_range_changed.connect(self.change_frequency_range)
+            self.main_window.center_frequency_locked.connect(self.toggle_center_frequency_lock)
+            self.main_window.analysis_bandwidth_changed.connect(self.change_analysis_bandwidth)
+            
+            # Connect sequential workflow signals
+            self.main_window.demodulate_triggered.connect(self.trigger_sequential_demodulation)
+            self.main_window.decode_triggered.connect(self.trigger_sequential_decoding)
     
     def setup_timers(self):
         """Setup GUI update timers."""
@@ -581,7 +602,10 @@ class RFSpectrumAnalyzerApp(QObject):
     def update_spectrum_display(self):
         """Update spectrum display in GUI."""
         if self.main_window and len(self.spectrum_data) > 0:
+            self.logger.debug(f"Updating spectrum display with {len(self.spectrum_data)} points")
             self.main_window.update_spectrum(self.spectrum_data)
+        else:
+            self.logger.debug(f"No spectrum update: main_window={self.main_window is not None}, spectrum_data_len={len(self.spectrum_data)}")
     
     def update_waterfall_display(self):
         """Update waterfall display in GUI."""
@@ -725,19 +749,32 @@ class RFSpectrumAnalyzerApp(QObject):
     def setup_demo_mode(self):
         """Setup demo mode with simulated data generation."""
         self.logger.info("Setting up demo mode with simulated data")
+        print("DEMO SETUP: Setting up demo mode")
         
         if self.demo_timer:
+            print(f"DEMO SETUP: Timer exists, connecting to generate_demo_data")
             self.demo_timer.timeout.connect(self.generate_demo_data)
             self.demo_timer.start(100)  # Generate data every 100ms
+            self.logger.info("Demo timer started - generating data every 100ms")
+            print(f"DEMO SETUP: Timer started with 100ms interval")
+        else:
+            print("DEMO SETUP: ERROR - Timer is None!")
+            self.logger.error("Demo timer is None!")
     
     def generate_demo_data(self):
         """Generate simulated IQ data for demonstration."""
+        # CRITICAL DEBUG: This should appear if timer is working
+        print("TIMER TRIGGERED: generate_demo_data called")
+        self.logger.debug("TIMER TRIGGERED: generate_demo_data called")
+        
         try:
             self.logger.debug(f"Generating demo data, counter: {self.demo_counter}")
             
             # Parameters
             sample_rate = self.settings.sdr.sample_rate
             num_samples = self.settings.dsp.fft_size
+            
+            self.logger.debug(f"Demo parameters: sample_rate={sample_rate}, num_samples={num_samples}")
             
             # Generate different signal types based on demo counter
             signal_type = (self.demo_counter // 50) % 4
@@ -785,6 +822,8 @@ class RFSpectrumAnalyzerApp(QObject):
             # Send to processing pipeline
             self.on_new_data(signal.astype(np.complex64))
             self.demo_counter += 1
+            
+            self.logger.debug(f"Demo data stored: {len(signal)} samples, type: {type(signal)}, signal_type: {signal_type}")
             
         except Exception as e:
             self.logger.debug(f"Error generating demo data: {e}")
@@ -863,3 +902,163 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.logger.info(f"Detection interval set to {interval_ms} ms")
         except Exception as e:
             self.logger.error(f"Error changing detection interval: {e}")
+    
+    # Sequential Workflow Methods
+    def trigger_sequential_demodulation(self):
+        """Trigger demodulation for selected frequency range."""
+        try:
+            if not hasattr(self, 'analysis_f1') or not hasattr(self, 'analysis_f2'):
+                self.logger.warning("No frequency range selected for demodulation")
+                return
+                
+            self.logger.info(f"Starting demodulation for range {self.analysis_f1/1e6:.3f} - {self.analysis_f2/1e6:.3f} MHz")
+            
+            if hasattr(self, 'signal_processor') and self.signal_processor:
+                # Set frequency range for processing
+                self.signal_processor.set_analysis_frequency_range(self.analysis_f1, self.analysis_f2)
+                
+                # Trigger automatic modulation detection and demodulation
+                result = self.signal_processor.detect_and_demodulate()
+                
+                if result and result.get('success', False):
+                    self.logger.info(f"Demodulation successful: {result.get('modulation_type', 'Unknown')}")
+                    # Update controls widget with demodulation result
+                    if hasattr(self, 'main_window') and self.main_window:
+                        self.main_window.controls_widget.update_demodulation_result(
+                            True, result.get('modulation_type', 'Unknown')
+                        )
+                else:
+                    self.logger.warning("Demodulation failed or no signal detected")
+                    if hasattr(self, 'main_window') and self.main_window:
+                        self.main_window.controls_widget.update_demodulation_result(False, "No Signal")
+                        
+        except Exception as e:
+            self.logger.error(f"Error in sequential demodulation: {e}")
+            if hasattr(self, 'main_window') and self.main_window:
+                self.main_window.controls_widget.update_demodulation_result(False, "Error")
+    
+    def trigger_sequential_decoding(self):
+        """Trigger decoding for demodulated signal."""
+        try:
+            if not hasattr(self, 'signal_processor') or not self.signal_processor:
+                self.logger.warning("Signal processor not available for decoding")
+                return
+                
+            self.logger.info("Starting sequential decoding")
+            
+            # Check if demodulation was successful first
+            if not self.signal_processor.has_demodulated_data():
+                self.logger.warning("No demodulated data available for decoding")
+                if hasattr(self, 'main_window') and self.main_window:
+                    self.main_window.controls_widget.update_decoding_result(False, "No Data")
+                return
+            
+            # Trigger automatic channel coding detection and decoding
+            result = self.signal_processor.detect_and_decode()
+            
+            if result and result.get('success', False):
+                self.logger.info(f"Decoding successful: {result.get('coding_type', 'Unknown')}")
+                # Update controls widget with decoding result
+                if hasattr(self, 'main_window') and self.main_window:
+                    self.main_window.controls_widget.update_decoding_result(
+                        True, result.get('coding_type', 'Unknown')
+                    )
+            else:
+                self.logger.warning("Decoding failed or no coding detected")
+                if hasattr(self, 'main_window') and self.main_window:
+                    self.main_window.controls_widget.update_decoding_result(False, "No Coding")
+                    
+        except Exception as e:
+            self.logger.error(f"Error in sequential decoding: {e}")
+            if hasattr(self, 'main_window') and self.main_window:
+                self.main_window.controls_widget.update_decoding_result(False, "Error")
+    
+    # Frequency Analysis Methods
+    def change_frequency_range(self, f1: float, f2: float):
+        """Change frequency range for analysis."""
+        try:
+            self.logger.info(f"Frequency range changed: {f1/1e6:.3f} MHz - {f2/1e6:.3f} MHz")
+            
+            # Store frequency range for analysis
+            self.analysis_f1 = f1
+            self.analysis_f2 = f2
+            
+            # Update main window with frequency range
+            if hasattr(self, 'main_window') and self.main_window:
+                self.main_window.set_frequency_range(f1, f2)
+                
+        except Exception as e:
+            self.logger.error(f"Error changing frequency range: {e}")
+    
+    def toggle_center_frequency_lock(self, locked: bool):
+        """Toggle center frequency lock."""
+        try:
+            self.center_freq_locked = locked
+            self.logger.info(f"Center frequency {'locked' if locked else 'unlocked'}")
+            
+            if locked and hasattr(self, 'analysis_f1') and hasattr(self, 'analysis_f2'):
+                # Set center frequency to middle of analysis range
+                center_freq = (self.analysis_f1 + self.analysis_f2) / 2
+                self.change_frequency(center_freq)
+                
+        except Exception as e:
+            self.logger.error(f"Error toggling center frequency lock: {e}")
+    
+    def change_analysis_bandwidth(self, bandwidth: float):
+        """Change analysis bandwidth."""
+        try:
+            self.analysis_bandwidth = bandwidth
+            self.logger.info(f"Analysis bandwidth set to {bandwidth/1e6:.3f} MHz")
+            
+            # Update sample rate if needed for bandwidth
+            if bandwidth > self.settings.sdr.sample_rate:
+                self.logger.warning(f"Analysis bandwidth ({bandwidth/1e6:.3f} MHz) exceeds sample rate ({self.settings.sdr.sample_rate/1e6:.3f} MHz)")
+                
+        except Exception as e:
+            self.logger.error(f"Error changing analysis bandwidth: {e}")
+    
+    def enable_real_time_spectrum(self, enabled: bool, update_rate: int = 10):
+        """Enable real-time spectrum display."""
+        try:
+            if enabled:
+                # Update spectrum update rate
+                self.settings.gui.spectrum_update_rate = update_rate
+                spectrum_interval = int(1000 / update_rate)
+                self.spectrum_timer.setInterval(spectrum_interval)
+                
+                self.logger.info(f"Real-time spectrum enabled at {update_rate} Hz")
+            else:
+                self.logger.info("Real-time spectrum disabled")
+                
+        except Exception as e:
+            self.logger.error(f"Error enabling real-time spectrum: {e}")
+    
+    def get_frequency_range_data(self, f1: float, f2: float) -> Optional[np.ndarray]:
+        """Get spectrum data for specific frequency range."""
+        try:
+            if not hasattr(self, '_latest_spectrum') or self._latest_spectrum is None:
+                return None
+                
+            # Calculate frequency axis
+            sample_rate = self.settings.sdr.sample_rate
+            center_freq = self.settings.sdr.center_frequency
+            fft_size = len(self._latest_spectrum)
+            
+            freq_axis = np.linspace(
+                center_freq - sample_rate/2,
+                center_freq + sample_rate/2,
+                fft_size
+            )
+            
+            # Find indices for frequency range
+            idx1 = np.argmin(np.abs(freq_axis - f1))
+            idx2 = np.argmin(np.abs(freq_axis - f2))
+            
+            if idx1 > idx2:
+                idx1, idx2 = idx2, idx1
+                
+            return self._latest_spectrum[idx1:idx2+1]
+            
+        except Exception as e:
+            self.logger.error(f"Error getting frequency range data: {e}")
+            return None

@@ -47,6 +47,7 @@ class DemodulationEngine:
             "AM": AMDemodulator(self.sample_rate),
             "FM": FMDemodulator(self.sample_rate),
             "PSK": PSKDemodulator(self.sample_rate),
+            "BPSK": PSKDemodulator(self.sample_rate),  # BPSK is the same as PSK
             "QPSK": QPSKDemodulator(self.sample_rate),
             "8PSK": PSK8Demodulator(self.sample_rate),
             "QAM16": QAM16Demodulator(self.sample_rate),
@@ -115,6 +116,52 @@ class BaseDemodulator:
         if np.std(signal_data) > 0:
             return signal_data / np.std(signal_data)
         return signal_data
+    
+    def _ensure_numpy_array(self, data: Any) -> np.ndarray:
+        """
+        Ensure data is a proper numpy array, handling various return types from 
+        different signal processing libraries.
+        
+        Args:
+            data: Input data (could be tuple, list, array, complex array, etc.)
+            
+        Returns:
+            numpy array with consistent data type
+        """
+        try:
+            # Handle tuple returns (from sdr library)
+            if isinstance(data, tuple):
+                if len(data) == 0:
+                    return np.array([])
+                # Take the first element if it's a data tuple
+                data = data[0]
+            
+            # Convert to numpy array
+            if not isinstance(data, np.ndarray):
+                data = np.array(data)
+            
+            # Handle complex data - convert to real if all imaginary parts are zero
+            if data.dtype == np.complex128 or data.dtype == np.complex64:
+                if np.allclose(np.imag(data), 0):
+                    data = np.real(data)
+            
+            # Ensure 1D array
+            if data.ndim > 1:
+                data = data.flatten()
+            
+            # Convert to appropriate integer type for digital data
+            if data.dtype == np.float64 or data.dtype == np.float32:
+                # Threshold floating point data to binary for digital signals
+                if np.all((data >= 0) & (data <= 1)):
+                    data = (data > 0.5).astype(int)
+                elif np.all((data >= -1) & (data <= 1)):
+                    data = (data > 0).astype(int)
+            
+            return data
+            
+        except Exception as e:
+            logger.warning(f"Data type conversion error: {e}, returning empty array")
+            return np.array([])
     
     def _apply_agc(self, signal_data: np.ndarray, target_power: float = 1.0) -> np.ndarray:
         """Apply Automatic Gain Control."""
@@ -254,9 +301,28 @@ class PSKDemodulator(BaseDemodulator):
             # Phase recovery using Costas loop
             phase_recovered = self._costas_loop(recovered_symbols, M)
             
-            # Symbol decision
-            symbols = constellation.decide(phase_recovered)
-            bits = constellation.demodulate(symbols)
+            # Symbol decision with proper error handling
+            try:
+                # Try sdr library methods
+                if hasattr(constellation, 'decide'):
+                    symbols = constellation.decide(phase_recovered)
+                    bits = constellation.demodulate(symbols)
+                elif hasattr(constellation, 'demodulate'):
+                    bits = constellation.demodulate(phase_recovered)
+                    symbols = self._bpsk_decision(phase_recovered)
+                else:
+                    # Manual BPSK decision
+                    symbols = self._bpsk_decision(phase_recovered)
+                    bits = self._bpsk_to_bits(symbols)
+                    
+                # Ensure proper data types
+                bits = self._ensure_numpy_array(bits)
+                symbols = self._ensure_numpy_array(symbols)
+                
+            except Exception:
+                # Fallback to manual BPSK decision
+                symbols = self._bpsk_decision(phase_recovered)
+                bits = self._bpsk_to_bits(symbols)
             
             # Calculate metrics
             evm = self._calculate_evm_advanced(phase_recovered, symbols)
@@ -518,6 +584,28 @@ class PSKDemodulator(BaseDemodulator):
             logger.warning(f"BER estimation error: {e}")
         
         return 0.0
+    
+    def _bpsk_decision(self, symbols: np.ndarray) -> np.ndarray:
+        """Make BPSK symbol decisions."""
+        try:
+            # BPSK decision: positive real = +1, negative real = -1
+            decisions = np.sign(np.real(symbols))
+            # Ensure no zeros (handle case where real part is exactly 0)
+            decisions[decisions == 0] = 1
+            return decisions
+        except Exception as e:
+            logger.warning(f"BPSK decision error: {e}")
+            return np.ones(len(symbols))  # Fallback to all +1
+    
+    def _bpsk_to_bits(self, symbols: np.ndarray) -> np.ndarray:
+        """Convert BPSK symbols to bits."""
+        try:
+            # Map +1 to bit 1, -1 to bit 0
+            bits = (symbols > 0).astype(int)
+            return bits
+        except Exception as e:
+            logger.warning(f"BPSK to bits conversion error: {e}")
+            return np.zeros(len(symbols), dtype=int)  # Fallback to all 0s
 
 
 class QPSKDemodulator(BaseDemodulator):
@@ -631,6 +719,11 @@ class QPSKDemodulator(BaseDemodulator):
                     # Manual QPSK decision
                     decided_symbols = self._qpsk_decision(phase_recovered)
                     bits = self._qpsk_to_bits(decided_symbols)
+                    
+                # Ensure proper data types
+                bits = self._ensure_numpy_array(bits)
+                decided_symbols = self._ensure_numpy_array(decided_symbols)
+                
             except Exception:
                 # Fallback to manual decision
                 decided_symbols = self._qpsk_decision(phase_recovered)
@@ -1294,19 +1387,31 @@ class FSKDemodulator(BaseDemodulator):
             # Use scikit-dsp-comm's FSK demodulation capabilities
             samples_per_symbol = int(self.sample_rate / self.symbol_rate)
             
-            # Create bandpass filters for mark and space frequencies
+            # Ensure filter parameters are valid
+            filter_length = int(filter_length) if 'filter_length' in locals() else int(101)  # Ensure integer
+            nyquist_freq = self.sample_rate / 2
+            
+            # Calculate normalized frequencies (ensure they're in valid range)
+            mark_low = max(0.01, (self.mark_frequency - self.symbol_rate/2) / nyquist_freq)
+            mark_high = min(0.99, (self.mark_frequency + self.symbol_rate/2) / nyquist_freq)
+            space_low = max(0.01, (self.space_frequency - self.symbol_rate/2) / nyquist_freq)
+            space_high = min(0.99, (self.space_frequency + self.symbol_rate/2) / nyquist_freq)
+            
+            # Create bandpass filters for mark and space frequencies with proper parameters
             mark_filter = fir.firwin_kaiser_bpf(
-                101, 
-                (self.mark_frequency - self.symbol_rate/2) / (self.sample_rate/2),
-                (self.mark_frequency + self.symbol_rate/2) / (self.sample_rate/2),
-                60
+                filter_length,  # N (integer filter length)
+                mark_low,       # f_pass1 (normalized frequency)
+                mark_high,      # f_pass2 (normalized frequency)
+                60,             # d_pass (passband ripple in dB)
+                80              # d_stop (stopband attenuation in dB)
             )
             
             space_filter = fir.firwin_kaiser_bpf(
-                101,
-                (self.space_frequency - self.symbol_rate/2) / (self.sample_rate/2),
-                (self.space_frequency + self.symbol_rate/2) / (self.sample_rate/2),
-                60
+                filter_length,  # N (integer filter length)
+                space_low,      # f_pass1 (normalized frequency)  
+                space_high,     # f_pass2 (normalized frequency)
+                60,             # d_pass (passband ripple in dB)
+                80              # d_stop (stopband attenuation in dB)
             )
             
             # Filter signals

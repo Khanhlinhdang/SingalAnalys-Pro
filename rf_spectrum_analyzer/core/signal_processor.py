@@ -170,6 +170,9 @@ class SignalProcessor:
             if len(iq_samples) < self.fft_size:
                 return None
             
+            # Store IQ data for sequential workflow
+            self._current_iq_data = iq_samples.copy()
+            
             # Extract samples for FFT
             samples = iq_samples[:self.fft_size].astype(np.complex64)
             
@@ -876,6 +879,16 @@ class SignalProcessor:
                 # Extract demodulated data
                 demod_data = demod_result.get("demodulated_data", np.array([]))
                 
+                # Ensure demod_data is a numpy array (handle tuple returns from sdr library)
+                if isinstance(demod_data, tuple):
+                    # If sdr library returns tuple, take the first element (usually the data)
+                    self.logger.debug("Converting tuple demodulated data to numpy array")
+                    demod_data = np.array(demod_data[0]) if len(demod_data) > 0 else np.array([])
+                elif not isinstance(demod_data, np.ndarray):
+                    # Convert any other type to numpy array
+                    self.logger.debug(f"Converting {type(demod_data)} demodulated data to numpy array")
+                    demod_data = np.array(demod_data)
+                
                 # Step 3: Encoding Analysis (for digital data)
                 if demod_result.get("data_type") == "digital" and len(demod_data) > 0:
                     self.logger.debug("Step 3: Analyzing encoding...")
@@ -1414,3 +1427,220 @@ class SignalProcessor:
             "fft_size": self.fft_size,
             "averaging": self.averaging
         }
+    
+    # Sequential Workflow Methods
+    def set_analysis_frequency_range(self, f1: float, f2: float):
+        """Set frequency range for focused analysis."""
+        try:
+            self.analysis_f1 = f1
+            self.analysis_f2 = f2
+            self.analysis_bandwidth = f2 - f1
+            
+            # Calculate frequency shift to center the range
+            center_freq = (f1 + f2) / 2
+            current_center = self.settings.sdr.center_frequency
+            self.frequency_offset = center_freq - current_center
+            
+            self.logger.info(f"Analysis frequency range set: {f1/1e6:.3f} - {f2/1e6:.3f} MHz")
+            self.logger.info(f"Analysis bandwidth: {self.analysis_bandwidth/1e6:.3f} MHz")
+            
+        except Exception as e:
+            self.logger.error(f"Error setting analysis frequency range: {e}")
+    
+    def detect_and_demodulate(self) -> Optional[Dict[str, Any]]:
+        """Detect modulation type and demodulate signal in frequency range."""
+        try:
+            if not hasattr(self, 'analysis_f1') or not hasattr(self, 'analysis_f2'):
+                self.logger.warning("No frequency range set for analysis")
+                return {"success": False, "error": "No frequency range set"}
+            
+            # Get current IQ data buffer
+            if not hasattr(self, '_current_iq_data') or self._current_iq_data is None or len(self._current_iq_data) == 0:
+                self.logger.warning("No IQ data available for analysis")
+                return {"success": False, "error": "No IQ data available"}
+            
+            # Filter signal to analysis bandwidth
+            filtered_iq = self._filter_to_frequency_range(self._current_iq_data)
+            
+            if len(filtered_iq) == 0:
+                return {"success": False, "error": "No signal in frequency range"}
+            
+            # Detect modulation type
+            modulation_result = self._detect_modulation_type(filtered_iq)
+            
+            if not modulation_result or not modulation_result.get('success', False):
+                return {"success": False, "error": "Modulation detection failed"}
+            
+            modulation_type = modulation_result.get('modulation_type', 'unknown')
+            
+            # Demodulate signal
+            demod_result = self.demodulate_signal(filtered_iq, modulation_type)
+            
+            if demod_result and demod_result.get('success', False):
+                # Store demodulated data for decoding step
+                self.demodulated_data = demod_result.get('demodulated_data', np.array([]))
+                self.demodulated_metadata = {
+                    'modulation_type': modulation_type,
+                    'frequency_range': (self.analysis_f1, self.analysis_f2),
+                    'demodulation_params': demod_result.get('parameters', {})
+                }
+                
+                return {
+                    "success": True,
+                    "modulation_type": modulation_type,
+                    "demodulated_data": self.demodulated_data,
+                    "metadata": self.demodulated_metadata
+                }
+            else:
+                return {"success": False, "error": "Demodulation failed"}
+                
+        except Exception as e:
+            self.logger.error(f"Error in detect_and_demodulate: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def detect_and_decode(self) -> Optional[Dict[str, Any]]:
+        """Detect coding type and decode demodulated signal."""
+        try:
+            if not self.has_demodulated_data():
+                return {"success": False, "error": "No demodulated data available"}
+            
+            # Detect channel coding type
+            coding_result = self._detect_coding_type(self.demodulated_data)
+            
+            if not coding_result or not coding_result.get('success', False):
+                return {"success": False, "error": "Coding detection failed"}
+            
+            coding_type = coding_result.get('coding_type', 'unknown')
+            
+            # Decode data
+            decode_result = self.decode_data(self.demodulated_data, coding_type)
+            
+            if decode_result and decode_result.get('success', False):
+                decoded_data = decode_result.get('decoded_data', np.array([]))
+                
+                return {
+                    "success": True,
+                    "coding_type": coding_type,
+                    "decoded_data": decoded_data,
+                    "metadata": {
+                        'original_modulation': getattr(self, 'demodulated_metadata', {}).get('modulation_type', 'unknown'),
+                        'coding_params': decode_result.get('parameters', {})
+                    }
+                }
+            else:
+                return {"success": False, "error": "Decoding failed"}
+                
+        except Exception as e:
+            self.logger.error(f"Error in detect_and_decode: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def has_demodulated_data(self) -> bool:
+        """Check if demodulated data is available."""
+        return (hasattr(self, 'demodulated_data') and 
+                self.demodulated_data is not None and 
+                len(self.demodulated_data) > 0)
+    
+    def _filter_to_frequency_range(self, iq_data: np.ndarray) -> np.ndarray:
+        """Filter IQ data to analysis frequency range."""
+        try:
+            if not hasattr(self, 'frequency_offset'):
+                return iq_data
+            
+            # Apply frequency shift to center the analysis range
+            sample_rate = self.settings.sdr.sample_rate
+            t = np.arange(len(iq_data)) / sample_rate
+            freq_shift = np.exp(-2j * np.pi * self.frequency_offset * t)
+            shifted_iq = iq_data * freq_shift
+            
+            # Low-pass filter to analysis bandwidth
+            nyquist = sample_rate / 2
+            cutoff = min(self.analysis_bandwidth / 2, nyquist * 0.9)
+            normalized_cutoff = cutoff / nyquist
+            
+            # Design filter
+            b, a = scipy.signal.butter(4, normalized_cutoff, btype='low')
+            filtered_iq = scipy.signal.filtfilt(b, a, shifted_iq)
+            
+            return filtered_iq
+            
+        except Exception as e:
+            self.logger.error(f"Error filtering to frequency range: {e}")
+            return iq_data
+    
+    def _detect_modulation_type(self, iq_data: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Detect modulation type from IQ data."""
+        try:
+            # Use modulation analyzer if available
+            if hasattr(self, 'modulation_analyzer') and self.modulation_analyzer:
+                return self.modulation_analyzer.analyze_modulation(iq_data)
+            
+            # Simple modulation detection based on signal characteristics
+            # Calculate signal statistics
+            magnitude = np.abs(iq_data)
+            phase = np.angle(iq_data)
+            
+            # Analyze magnitude variation (AM vs constant envelope)
+            mag_std = np.std(magnitude)
+            mag_mean = np.mean(magnitude)
+            magnitude_variation = mag_std / mag_mean if mag_mean > 0 else 0
+            
+            # Analyze phase characteristics
+            phase_diff = np.diff(np.unwrap(phase))
+            phase_std = np.std(phase_diff)
+            
+            # Simple classification
+            if magnitude_variation > 0.2:
+                modulation_type = "AM"
+            elif phase_std > 0.5:
+                modulation_type = "FM"
+            else:
+                modulation_type = "PSK"
+            
+            return {
+                "success": True,
+                "modulation_type": modulation_type,
+                "confidence": 0.7,  # Basic detection has lower confidence
+                "parameters": {
+                    "magnitude_variation": magnitude_variation,
+                    "phase_std": phase_std
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting modulation type: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def _detect_coding_type(self, demod_data: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Detect channel coding type from demodulated data."""
+        try:
+            # Use encoding analyzer if available
+            if hasattr(self, 'encoding_analyzer') and self.encoding_analyzer:
+                return self.encoding_analyzer.analyze_encoding(demod_data)
+            
+            # Simple coding detection
+            # Check for typical coding patterns
+            data_len = len(demod_data)
+            
+            # Check for block code patterns (fixed length blocks)
+            if data_len % 7 == 0:
+                coding_type = "hamming_7_4"
+            elif data_len % 15 == 0:
+                coding_type = "bch_15_11"
+            elif data_len > 100:  # Longer sequences might be convolutional
+                coding_type = "convolutional_1_2"
+            else:
+                coding_type = "none"
+            
+            return {
+                "success": True,
+                "coding_type": coding_type,
+                "confidence": 0.6,  # Basic detection has lower confidence
+                "parameters": {
+                    "data_length": data_len,
+                    "estimated_rate": "1/2" if coding_type.startswith("convolutional") else "variable"
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting coding type: {e}")
+            return {"success": False, "error": str(e)}

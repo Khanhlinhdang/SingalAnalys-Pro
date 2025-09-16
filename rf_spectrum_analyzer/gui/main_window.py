@@ -49,6 +49,16 @@ class MainWindow(QMainWindow):
     detection_threshold_changed = Signal(float)
     detection_interval_changed = Signal(int)
     
+    # Frequency analysis signals
+    frequency_range_changed = Signal(float, float)
+    frequency_markers_toggled = Signal(bool)
+    center_frequency_locked = Signal(bool)
+    analysis_bandwidth_changed = Signal(float)
+    
+    # Sequential workflow signals
+    demodulate_triggered = Signal()
+    decode_triggered = Signal()
+    
     def __init__(self, settings: Settings, app=None, parent=None):
         super().__init__(parent)
         self.settings = settings
@@ -330,8 +340,19 @@ class MainWindow(QMainWindow):
         self.controls_widget.detection_threshold_changed.connect(self.detection_threshold_changed.emit)
         self.controls_widget.detection_interval_changed.connect(self.detection_interval_changed.emit)
         
+        # Connect frequency analysis signals
+        self.controls_widget.frequency_range_changed.connect(self.frequency_range_changed.emit)
+        self.controls_widget.frequency_markers_toggled.connect(self._on_frequency_markers_toggled)
+        self.controls_widget.center_frequency_locked.connect(self.center_frequency_locked.emit)
+        self.controls_widget.analysis_bandwidth_changed.connect(self.analysis_bandwidth_changed.emit)
+        
+        # Connect sequential workflow signals
+        self.controls_widget.demodulate_triggered.connect(self.demodulate_triggered.emit)
+        self.controls_widget.decode_triggered.connect(self.decode_triggered.emit)
+        
         # Connect spectrum widget signals
         self.spectrum_widget.frequency_clicked.connect(self._on_frequency_clicked)
+        self.spectrum_widget.frequency_range_selected.connect(self._on_frequency_range_selected)
         
         # Connect settings changes
         self.controls_widget.settings_changed.connect(self._on_settings_changed)
@@ -538,6 +559,31 @@ class MainWindow(QMainWindow):
     def update_frequency_display(self, frequency: float):
         """Update frequency display in device controls."""
         self.controls_widget.update_frequency_display(frequency)
+    
+    def _on_frequency_markers_toggled(self, enabled: bool):
+        """Handle frequency markers toggle."""
+        self.spectrum_widget.set_frequency_markers_enabled(enabled)
+    
+    def _on_frequency_range_selected(self, f1: float, f2: float):
+        """Handle frequency range selection from spectrum widget."""
+        # Update controls widget with selected range
+        self.controls_widget.update_frequency_range_from_spectrum(f1, f2)
+        
+        # Emit signal for application to handle
+        self.frequency_range_changed.emit(f1, f2)
+    
+    def set_frequency_range(self, f1: float, f2: float):
+        """Set frequency range from external source."""
+        self.spectrum_widget.set_frequency_range(f1, f2)
+        self.controls_widget.update_frequency_range_from_spectrum(f1, f2)
+    
+    def enable_peak_hold(self, enabled: bool):
+        """Enable or disable peak hold functionality."""
+        self.spectrum_widget.set_peak_hold_enabled(enabled)
+    
+    def reset_peak_hold(self):
+        """Reset peak hold data."""
+        self.spectrum_widget.reset_peak_hold()
     
     def update_device_info(self, device_info: Dict[str, Any]):
         """Update device information display."""

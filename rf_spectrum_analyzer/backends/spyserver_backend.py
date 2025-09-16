@@ -27,7 +27,7 @@ class SpyServerBackend(SDRBackend):
         super().__init__(settings)
         self.spyserver_client = None
         self.device_type = SDRDeviceType.SPYSERVER
-        self.host = getattr(settings.sdr, 'spyserver_host', 'localhost')
+        self.host = getattr(settings.sdr, 'spyserver_host', '204.144.195.52')
         self.port = getattr(settings.sdr, 'spyserver_port', 5555)
         self.timeout = getattr(settings.sdr, 'spyserver_timeout', 10.0)
     

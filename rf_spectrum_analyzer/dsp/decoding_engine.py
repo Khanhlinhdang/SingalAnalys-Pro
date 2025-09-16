@@ -484,26 +484,80 @@ class ConvolutionalDecoder(BaseDecoder):
     def _decode_with_scikit(self, encoded_data: np.ndarray) -> Dict[str, Any]:
         """Decode using scikit-dsp-comm library."""
         try:
+            # Calculate appropriate traceback depth based on data length and constraint length
+            # Traceback depth should be at least 5 times the constraint length but not larger than data length
+            min_traceback = 5 * self.constraint_length  # 5 * 7 = 35
+            max_traceback = min(len(encoded_data) // 2, 100)  # Don't exceed half the data length or 100
+            traceback_depth = max(min_traceback, min(max_traceback, 25))
+            
+            # Ensure we have enough data for decoding
+            if len(encoded_data) < traceback_depth:
+                logger.warning(f"Input data too short ({len(encoded_data)}) for traceback depth ({traceback_depth}), using simplified decoder")
+                return self._decode_simplified(encoded_data)
+            
             # Create convolutional encoder/decoder object
-            cc1 = fec_conv.FECConv(('1111001', '1011011'), 25)  # Rate 1/2, constraint length 7
+            cc1 = fec_conv.FECConv(('1111001', '1011011'), traceback_depth)  # Rate 1/2, constraint length 7
             
-            # Convert to soft decisions if needed
+            # Determine if input is hard or soft decisions
             if encoded_data.dtype == np.int8 or encoded_data.dtype == np.uint8:
-                # Convert hard decisions to soft decisions
-                soft_data = 2 * encoded_data.astype(float) - 1
+                # Input is hard decisions (0,1 integers)
+                hard_data = encoded_data.astype(int)
+                # Ensure values are in [0,1] range
+                hard_data = np.clip(hard_data, 0, 1)
+                viterbi_result = cc1.viterbi_decoder(hard_data, 'hard')
             else:
+                # Input is soft decisions (float values)
                 soft_data = encoded_data.astype(float)
+                # Ensure proper soft decision range
+                if np.max(np.abs(soft_data)) <= 1.0:
+                    # Already in [-1,1] range, use as-is
+                    pass
+                else:
+                    # Scale to [-1,1] range
+                    max_val = np.max(np.abs(soft_data))
+                    soft_data = soft_data / max_val
+                viterbi_result = cc1.viterbi_decoder(soft_data, 'soft')
             
-            # Viterbi decoding
-            decoded_bits, metric = cc1.viterbi_decoder(soft_data, 'hard')
+            # Handle different return types from viterbi_decoder
+            if isinstance(viterbi_result, tuple):
+                if len(viterbi_result) == 2:
+                    decoded_bits, metric = viterbi_result
+                else:
+                    # Unexpected tuple length, use first element
+                    decoded_bits = viterbi_result[0]
+                    metric = 0.0
+            else:
+                # Single return value
+                decoded_bits = viterbi_result
+                metric = 0.0
             
             # Calculate number of corrected errors (estimate)
-            # Re-encode to compare
-            reencoded = cc1.conv_encoder(decoded_bits)
+            # Re-encode to compare - need to provide initial state for encoder
+            try:
+                # Try encoding with initial state of 0
+                reencoded = cc1.conv_encoder(decoded_bits, state=0)
+            except TypeError:
+                # Fallback: try without state parameter or use alternative method
+                try:
+                    reencoded = cc1.conv_encoder(decoded_bits)
+                except:
+                    # If encoding fails, skip error calculation
+                    reencoded = None
             
-            # Count differences
-            hard_received = (soft_data > 0).astype(int)
-            errors_corrected = np.sum(hard_received != reencoded)
+            # Count differences - convert to hard decisions for comparison
+            if reencoded is not None:
+                if encoded_data.dtype == np.int8 or encoded_data.dtype == np.uint8:
+                    hard_received = encoded_data.astype(int)
+                else:
+                    # Convert soft decisions to hard decisions for error counting
+                    hard_received = (encoded_data > 0).astype(int)
+                
+                # Clip to ensure proper range and handle length mismatch
+                hard_received = np.clip(hard_received, 0, 1)
+                min_length = min(len(hard_received), len(reencoded))
+                errors_corrected = np.sum(hard_received[:min_length] != reencoded[:min_length])
+            else:
+                errors_corrected = 0
             
             return {
                 "decoded_data": decoded_bits.astype(np.uint8),
@@ -525,19 +579,29 @@ class ConvolutionalDecoder(BaseDecoder):
             generator_matrix = np.array([[0o171, 0o133]], dtype=int)  # Rate 1/2
             cc = convcode.ConvCode(generator_matrix, 7)  # Constraint length 7
             
-            # Convert to appropriate format
-            if encoded_data.dtype == np.uint8:
-                received_symbols = 2 * encoded_data.astype(float) - 1
+            # Handle different input types properly
+            if encoded_data.dtype == np.uint8 or encoded_data.dtype == np.int8:
+                # Hard decisions - convert to proper hard decision format
+                hard_symbols = encoded_data.astype(int)
+                hard_symbols = np.clip(hard_symbols, 0, 1)  # Ensure [0,1] range
+                decoded_bits = cc.viterbi_decoder(hard_symbols, 'hard')
+                received_for_comparison = hard_symbols
             else:
-                received_symbols = encoded_data.astype(float)
-            
-            # Viterbi decoding
-            decoded_bits = cc.viterbi_decoder(received_symbols, 'hard')
+                # Soft decisions - use soft decoding if available, otherwise convert
+                soft_symbols = encoded_data.astype(float)
+                try:
+                    # Try soft decoding first
+                    decoded_bits = cc.viterbi_decoder(soft_symbols, 'soft')
+                    received_for_comparison = (soft_symbols > 0).astype(int)
+                except:
+                    # Fallback to hard decoding
+                    hard_symbols = (soft_symbols > 0).astype(int)
+                    decoded_bits = cc.viterbi_decoder(hard_symbols, 'hard')
+                    received_for_comparison = hard_symbols
             
             # Calculate metrics
             reencoded = cc.conv_encoder(decoded_bits)
-            hard_received = (received_symbols > 0).astype(int)
-            errors_corrected = np.sum(hard_received != reencoded)
+            errors_corrected = np.sum(received_for_comparison != reencoded)
             
             return {
                 "decoded_data": decoded_bits.astype(np.uint8),

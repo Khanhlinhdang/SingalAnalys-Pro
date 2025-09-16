@@ -16,6 +16,7 @@ class SpectrumWidget(QWidget):
     """Widget for displaying real-time spectrum data."""
     
     frequency_clicked = Signal(float)  # Emitted when user clicks on frequency
+    frequency_range_selected = Signal(float, float)  # Emitted when user selects frequency range
     
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -34,6 +35,18 @@ class SpectrumWidget(QWidget):
         self.peaks_enabled = True
         self.peak_threshold = -60.0  # dB
         self.detected_peaks = []
+        
+        # Frequency analysis markers
+        self.f1_marker = None
+        self.f2_marker = None
+        self.freq_range_region = None
+        self.markers_enabled = False
+        self.f1_frequency = 0.0
+        self.f2_frequency = 0.0
+        
+        # Peak hold
+        self.peak_hold_enabled = False
+        self.peak_hold_data = np.array([])
         
         self.setup_ui()
         self.setup_plot()
@@ -125,6 +138,47 @@ class SpectrumWidget(QWidget):
         plot.addItem(self.crosshair_v, ignoreBounds=True)
         plot.addItem(self.crosshair_h, ignoreBounds=True)
         
+        # Create frequency analysis markers (f1, f2)
+        self.f1_marker = pg.InfiniteLine(
+            angle=90,
+            pos=100e6,  # Default 100 MHz
+            pen=pg.mkPen(color='lime', width=2, style=Qt.DashLine),
+            label='f1',
+            labelOpts={'color': 'lime', 'position': 0.95, 'anchors': [(0, 0), (0, 0)]},
+            movable=True
+        )
+        
+        self.f2_marker = pg.InfiniteLine(
+            angle=90,
+            pos=200e6,  # Default 200 MHz
+            pen=pg.mkPen(color='cyan', width=2, style=Qt.DashLine),
+            label='f2',
+            labelOpts={'color': 'cyan', 'position': 0.95, 'anchors': [(0, 0), (0, 0)]},
+            movable=True
+        )
+        
+        # Create frequency range region
+        self.freq_range_region = pg.LinearRegionItem(
+            values=[100e6, 200e6],
+            brush=pg.mkBrush(0, 255, 0, 30),  # Semi-transparent green
+            pen=pg.mkPen(color='green', width=1),
+            movable=True
+        )
+        
+        # Initially hide frequency markers
+        self.f1_marker.setVisible(False)
+        self.f2_marker.setVisible(False)
+        self.freq_range_region.setVisible(False)
+        
+        plot.addItem(self.f1_marker)
+        plot.addItem(self.f2_marker)
+        plot.addItem(self.freq_range_region)
+        
+        # Connect marker movement signals
+        self.f1_marker.sigPositionChanged.connect(self._on_f1_marker_moved)
+        self.f2_marker.sigPositionChanged.connect(self._on_f2_marker_moved)
+        self.freq_range_region.sigRegionChanged.connect(self._on_frequency_region_changed)
+        
         # Connect mouse events
         self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
@@ -144,12 +198,23 @@ class SpectrumWidget(QWidget):
         if len(self.frequency_axis) != len(spectrum_data):
             self._update_frequency_axis(len(spectrum_data))
         
+        # Handle peak hold
+        if self.peak_hold_enabled:
+            if len(self.peak_hold_data) != len(spectrum_data):
+                self.peak_hold_data = spectrum_data.copy()
+            else:
+                # Update peak hold data (keep maximum values)
+                self.peak_hold_data = np.maximum(self.peak_hold_data, spectrum_data)
+            display_data = self.peak_hold_data
+        else:
+            display_data = spectrum_data
+        
         # Update spectrum curve
-        self.spectrum_curve.setData(self.frequency_axis, spectrum_data)
+        self.spectrum_curve.setData(self.frequency_axis, display_data)
         
         # Detect and display peaks
         if self.peaks_enabled:
-            self._detect_and_show_peaks()
+            self._detect_and_show_peaks(display_data)
         
         # Auto-scale Y axis occasionally
         if hasattr(self, '_auto_scale_counter'):
@@ -173,9 +238,11 @@ class SpectrumWidget(QWidget):
         plot = self.plot_widget.getPlotItem()
         plot.setXRange(self.frequency_axis[0], self.frequency_axis[-1])
     
-    def _detect_and_show_peaks(self):
+    def _detect_and_show_peaks(self, spectrum_data=None):
         """Detect peaks in spectrum and display them."""
-        if len(self.spectrum_data) < 10:
+        data_to_analyze = spectrum_data if spectrum_data is not None else self.spectrum_data
+        
+        if len(data_to_analyze) < 10:
             return
         
         try:
@@ -183,7 +250,7 @@ class SpectrumWidget(QWidget):
             
             # Find peaks above threshold
             peaks, properties = find_peaks(
-                self.spectrum_data,
+                data_to_analyze,
                 height=self.peak_threshold,
                 distance=10,  # Minimum distance between peaks
                 prominence=5  # Minimum prominence
@@ -193,13 +260,13 @@ class SpectrumWidget(QWidget):
                 # Limit number of peaks displayed
                 if len(peaks) > 20:
                     # Keep only the highest peaks
-                    peak_heights = self.spectrum_data[peaks]
+                    peak_heights = data_to_analyze[peaks]
                     sorted_indices = np.argsort(peak_heights)[-20:]
                     peaks = peaks[sorted_indices]
                 
                 # Update peak scatter plot
                 peak_freqs = self.frequency_axis[peaks]
-                peak_powers = self.spectrum_data[peaks]
+                peak_powers = data_to_analyze[peaks]
                 
                 self.peak_scatter.setData(
                     pos=list(zip(peak_freqs, peak_powers)),
@@ -375,3 +442,83 @@ class SpectrumWidget(QWidget):
         self.frequency_axis = np.array([])
         self.detected_peaks = []
         self.info_label.setText("")
+        
+        # Clear peak hold data
+        self.peak_hold_data = np.array([])
+    
+    # Frequency Analysis Methods
+    def set_frequency_markers_enabled(self, enabled: bool):
+        """Enable or disable frequency markers display."""
+        self.markers_enabled = enabled
+        self.f1_marker.setVisible(enabled)
+        self.f2_marker.setVisible(enabled)
+        self.freq_range_region.setVisible(enabled)
+    
+    def set_frequency_range(self, f1: float, f2: float):
+        """Set frequency range markers."""
+        self.f1_frequency = f1
+        self.f2_frequency = f2
+        
+        self.f1_marker.setPos(f1)
+        self.f2_marker.setPos(f2)
+        self.freq_range_region.setRegion([f1, f2])
+    
+    def set_peak_hold_enabled(self, enabled: bool):
+        """Enable or disable peak hold functionality."""
+        self.peak_hold_enabled = enabled
+        if not enabled:
+            self.peak_hold_data = np.array([])
+    
+    def reset_peak_hold(self):
+        """Reset peak hold data."""
+        self.peak_hold_data = np.array([])
+    
+    def _on_f1_marker_moved(self):
+        """Handle f1 marker movement."""
+        f1 = self.f1_marker.value()
+        f2 = self.f2_marker.value()
+        
+        # Ensure f1 < f2
+        if f1 >= f2:
+            f1 = f2 - 1e6  # 1 MHz minimum difference
+            self.f1_marker.setPos(f1)
+        
+        self.f1_frequency = f1
+        self.freq_range_region.setRegion([f1, f2])
+        self.frequency_range_selected.emit(f1, f2)
+    
+    def _on_f2_marker_moved(self):
+        """Handle f2 marker movement."""
+        f1 = self.f1_marker.value()
+        f2 = self.f2_marker.value()
+        
+        # Ensure f2 > f1
+        if f2 <= f1:
+            f2 = f1 + 1e6  # 1 MHz minimum difference
+            self.f2_marker.setPos(f2)
+        
+        self.f2_frequency = f2
+        self.freq_range_region.setRegion([f1, f2])
+        self.frequency_range_selected.emit(f1, f2)
+    
+    def _on_frequency_region_changed(self):
+        """Handle frequency region change."""
+        f1, f2 = self.freq_range_region.getRegion()
+        
+        self.f1_frequency = f1
+        self.f2_frequency = f2
+        
+        self.f1_marker.setPos(f1)
+        self.f2_marker.setPos(f2)
+        
+        self.frequency_range_selected.emit(f1, f2)
+    
+    def get_frequency_range(self):
+        """Get current frequency range."""
+        return self.f1_frequency, self.f2_frequency
+    
+    def highlight_frequency_range(self, f1: float, f2: float):
+        """Highlight a specific frequency range on the spectrum."""
+        self.set_frequency_range(f1, f2)
+        if not self.markers_enabled:
+            self.set_frequency_markers_enabled(True)
