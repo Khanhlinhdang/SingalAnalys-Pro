@@ -611,3 +611,328 @@ def validate_signal(signal: np.ndarray, name: str = "signal") -> bool:
         return False
     
     return True
+
+
+# PySDR-inspired utility functions for signal processing optimization
+def add_awgn(samples: np.ndarray, snr_db: float) -> np.ndarray:
+    """
+    Add Additive White Gaussian Noise (AWGN) at specified SNR.
+    
+    Based on PySDR best practices for noise addition.
+    
+    Args:
+        samples: Input signal samples (real or complex)
+        snr_db: Desired Signal-to-Noise Ratio in dB
+        
+    Returns:
+        Signal with added noise
+        
+    Example:
+        >>> signal = np.exp(1j * 2 * np.pi * 0.1 * np.arange(100))
+        >>> noisy_signal = add_awgn(signal, snr_db=10)
+    """
+    # Calculate signal power
+    signal_power = np.mean(np.abs(samples)**2)
+    
+    # Calculate noise power from SNR
+    snr_linear = 10**(snr_db / 10)
+    noise_power = signal_power / snr_linear
+    
+    # Generate complex AWGN with proper variance
+    if np.iscomplexobj(samples):
+        # Complex noise: split power between I and Q
+        noise = np.random.normal(0, np.sqrt(noise_power/2), len(samples)) + \
+                1j * np.random.normal(0, np.sqrt(noise_power/2), len(samples))
+    else:
+        # Real noise
+        noise = np.random.normal(0, np.sqrt(noise_power), len(samples))
+    
+    return samples + noise
+
+
+def estimate_snr(samples: np.ndarray, method: str = "moment") -> float:
+    """
+    Estimate Signal-to-Noise Ratio from signal samples.
+    
+    Implements multiple SNR estimation methods from PySDR.
+    
+    Args:
+        samples: Input signal samples
+        method: Estimation method ("moment", "split_spectrum", "percentile")
+        
+    Returns:
+        Estimated SNR in dB
+        
+    Example:
+        >>> signal = add_awgn(np.ones(1000), snr_db=15)
+        >>> snr_est = estimate_snr(signal, method="moment")
+    """
+    if len(samples) == 0:
+        return 0.0
+    
+    if method == "moment":
+        # Second and fourth moment method
+        m2 = np.mean(np.abs(samples)**2)
+        m4 = np.mean(np.abs(samples)**4)
+        
+        if m2 == 0:
+            return 0.0
+        
+        # For complex AWGN: SNR = sqrt(2*m2^2 / (m4 - 2*m2^2)) - 1
+        snr_linear = np.sqrt(2 * m2**2 / (m4 - 2 * m2**2 + 1e-12)) - 1
+        snr_linear = max(snr_linear, 1e-12)  # Avoid log of negative
+        return 10 * np.log10(snr_linear)
+    
+    elif method == "split_spectrum":
+        # Split spectrum method: signal in center, noise at edges
+        fft_result = np.fft.fft(samples)
+        power_spectrum = np.abs(fft_result)**2
+        
+        n = len(power_spectrum)
+        # Signal power (center 50%)
+        center_start = n // 4
+        center_end = 3 * n // 4
+        signal_power = np.mean(power_spectrum[center_start:center_end])
+        
+        # Noise power (edges 25% each side)
+        noise_power = (np.mean(power_spectrum[:n//8]) + 
+                      np.mean(power_spectrum[-n//8:])) / 2
+        
+        if noise_power == 0:
+            return 60.0
+        
+        snr_linear = signal_power / noise_power
+        return 10 * np.log10(snr_linear)
+    
+    elif method == "percentile":
+        # Percentile-based method
+        abs_samples = np.abs(samples)
+        
+        # 90th percentile as signal level
+        signal_level = np.percentile(abs_samples, 90)
+        # 10th percentile as noise level
+        noise_level = np.percentile(abs_samples, 10)
+        
+        if noise_level == 0:
+            return 60.0
+        
+        snr_linear = (signal_level / noise_level)**2
+        return 10 * np.log10(snr_linear)
+    
+    else:
+        # Default to moment method
+        return estimate_snr(samples, method="moment")
+
+
+def remove_dc_offset(samples: np.ndarray) -> np.ndarray:
+    """
+    Remove DC offset from IQ samples.
+    
+    Simple and efficient DC removal as used in PySDR examples.
+    
+    Args:
+        samples: Input IQ samples
+        
+    Returns:
+        Samples with DC removed
+        
+    Example:
+        >>> samples = np.array([1+1j, 2+2j, 3+3j])
+        >>> corrected = remove_dc_offset(samples)
+    """
+    # Simply subtract the mean - very efficient
+    return samples - np.mean(samples)
+
+
+def normalize_power(samples: np.ndarray, target_power: float = 1.0) -> np.ndarray:
+    """
+    Normalize signal to unit average power.
+    
+    Ensures consistent power levels as recommended in PySDR.
+    
+    Args:
+        samples: Input signal samples
+        target_power: Target average power (default 1.0)
+        
+    Returns:
+        Power-normalized samples
+        
+    Example:
+        >>> samples = np.random.randn(1000) + 1j*np.random.randn(1000)
+        >>> normalized = normalize_power(samples)
+        >>> np.mean(np.abs(normalized)**2)  # Should be ~1.0
+    """
+    current_power = np.mean(np.abs(samples)**2)
+    
+    if current_power == 0:
+        return samples
+    
+    scale_factor = np.sqrt(target_power / current_power)
+    return samples * scale_factor
+
+
+def frequency_shift(samples: np.ndarray, freq_offset: float, sample_rate: float) -> np.ndarray:
+    """
+    Shift signal in frequency domain.
+    
+    Efficient frequency shifting as used in PySDR for frequency correction.
+    
+    Args:
+        samples: Input signal samples
+        freq_offset: Frequency offset in Hz (positive = shift up)
+        sample_rate: Sample rate in Hz
+        
+    Returns:
+        Frequency-shifted samples
+        
+    Example:
+        >>> # Shift signal by 1 kHz
+        >>> signal = np.exp(1j * 2 * np.pi * 5000 * np.arange(1000) / 48000)
+        >>> shifted = frequency_shift(signal, 1000, 48000)
+    """
+    # Generate complex exponential for frequency shift
+    t = np.arange(len(samples)) / sample_rate
+    shift_signal = np.exp(2j * np.pi * freq_offset * t)
+    
+    return samples * shift_signal
+
+
+def apply_agc(samples: np.ndarray, reference: float = 1.0, 
+              attack: float = 0.01, release: float = 0.1) -> np.ndarray:
+    """
+    Apply Automatic Gain Control (AGC) to signal.
+    
+    Simple AGC implementation for consistent signal levels.
+    
+    Args:
+        samples: Input signal samples
+        reference: Target reference level
+        attack: Attack time constant (0-1)
+        release: Release time constant (0-1)
+        
+    Returns:
+        AGC-applied samples
+    """
+    output = np.zeros_like(samples)
+    gain = 1.0
+    
+    for i, sample in enumerate(samples):
+        # Measure instantaneous amplitude
+        amplitude = np.abs(sample)
+        
+        # Compute desired gain
+        if amplitude > 0:
+            desired_gain = reference / amplitude
+        else:
+            desired_gain = 1.0
+        
+        # Smooth gain adjustment
+        if desired_gain < gain:
+            # Attack (reduce gain quickly)
+            gain = gain * (1 - attack) + desired_gain * attack
+        else:
+            # Release (increase gain slowly)
+            gain = gain * (1 - release) + desired_gain * release
+        
+        # Apply gain
+        output[i] = sample * gain
+    
+    return output
+
+
+def compute_spectrogram_efficient(samples: np.ndarray, fft_size: int = 1024, 
+                                  overlap: int = 512) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute spectrogram efficiently using PySDR row-by-row pattern.
+    
+    This is optimized for real-time processing as shown in PySDR examples.
+    
+    Args:
+        samples: Input signal samples
+        fft_size: FFT size
+        overlap: Number of overlapping samples
+        
+    Returns:
+        Tuple of (spectrogram 2D array, time axis, frequency axis)
+        
+    Example:
+        >>> samples = np.random.randn(10000) + 1j*np.random.randn(10000)
+        >>> spec, t, f = compute_spectrogram_efficient(samples, fft_size=1024)
+    """
+    hop_size = fft_size - overlap
+    num_rows = (len(samples) - fft_size) // hop_size + 1
+    
+    # Pre-allocate spectrogram array
+    spectrogram = np.zeros((num_rows, fft_size), dtype=np.float32)
+    
+    # Window for better spectral resolution
+    window = np.hanning(fft_size)
+    
+    # Compute row by row (PySDR pattern)
+    for i in range(num_rows):
+        start_idx = i * hop_size
+        end_idx = start_idx + fft_size
+        
+        if end_idx > len(samples):
+            break
+        
+        # Extract segment and apply window
+        segment = samples[start_idx:end_idx] * window
+        
+        # Compute FFT and shift
+        fft_result = np.fft.fftshift(np.fft.fft(segment))
+        
+        # Convert to dB
+        spectrogram[i, :] = 10 * np.log10(np.abs(fft_result)**2 + 1e-12)
+    
+    # Create time and frequency axes
+    time_axis = np.arange(num_rows) * hop_size / fft_size
+    freq_axis = np.linspace(-0.5, 0.5, fft_size)
+    
+    return spectrogram, time_axis, freq_axis
+
+
+def downsample_efficient(samples: np.ndarray, decimation_factor: int) -> np.ndarray:
+    """
+    Efficiently downsample signal with anti-aliasing.
+    
+    Uses scipy's decimate for proper anti-aliasing filtering.
+    
+    Args:
+        samples: Input signal samples
+        decimation_factor: Decimation factor
+        
+    Returns:
+        Downsampled signal
+    """
+    if decimation_factor == 1:
+        return samples
+    
+    # Use scipy's decimate with default 8th-order Chebyshev filter
+    return signal.decimate(samples, decimation_factor, zero_phase=True)
+
+
+def upsample_efficient(samples: np.ndarray, interpolation_factor: int) -> np.ndarray:
+    """
+    Efficiently upsample signal with anti-imaging.
+    
+    Args:
+        samples: Input signal samples
+        interpolation_factor: Interpolation factor
+        
+    Returns:
+        Upsampled signal
+    """
+    if interpolation_factor == 1:
+        return samples
+    
+    # Zero-stuff
+    upsampled = np.zeros(len(samples) * interpolation_factor, dtype=samples.dtype)
+    upsampled[::interpolation_factor] = samples
+    
+    # Design anti-imaging filter
+    cutoff = 0.8 / interpolation_factor  # Cutoff at 80% of new Nyquist
+    taps = signal.firwin(64, cutoff)
+    
+    # Apply filter and scale
+    return signal.lfilter(taps, 1.0, upsampled) * interpolation_factor
