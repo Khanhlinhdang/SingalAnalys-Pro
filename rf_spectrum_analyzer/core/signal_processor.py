@@ -139,14 +139,23 @@ class SignalProcessor:
         self.logger.info("Signal processor initialized")
     
     def _setup_fft(self):
-        """Setup optimized FFT computation with pyFFTW."""
+        """Setup optimized FFT computation with pyFFTW and PySDR best practices."""
         # Create window
         self.window = self._create_window(self.settings.dsp.window_type, self.fft_size)
+        
+        # Calculate window correction factors (PySDR best practice)
+        self.window_coherent_gain = len(self.window) / np.sum(self.window)
+        self.window_enbw = len(self.window) * np.sum(self.window**2) / (np.sum(self.window)**2)
+        
+        # Check if FFT size is power of 2 for np.roll optimization
+        self._use_roll_for_shift = (self.fft_size & (self.fft_size - 1)) == 0
         
         # Setup averaging with pre-allocated arrays
         self.averaging = self.settings.dsp.averaging
         self.spectrum_history = []
         self._spectrum_sum = None  # Pre-allocated sum array for averaging
+        self._exponential_avg_buffer = None  # For exponential moving average
+        self._ema_alpha = 2.0 / (self.averaging + 1)  # EMA smoothing factor
         
         # Setup optimized FFTW if available
         if PYFFTW_AVAILABLE:
@@ -266,8 +275,11 @@ class SignalProcessor:
                 np.log10(self._power_spectrum, out=self._power_db)
                 self._power_db *= 10.0
                 
-                # FFT shift to center DC
-                power_db_shifted = np.fft.fftshift(self._power_db)
+                # Use np.roll for power-of-2 FFT sizes (PySDR optimization)
+                if self._use_roll_for_shift:
+                    power_db_shifted = np.roll(self._power_db, self.fft_size // 2)
+                else:
+                    power_db_shifted = np.fft.fftshift(self._power_db)
                 
             elif self.fft_method == 'pyfftw':
                 # Basic FFTW path
@@ -344,27 +356,19 @@ class SignalProcessor:
         return np.mean(self.spectrum_history, axis=0)
     
     def _apply_optimized_averaging(self, spectrum: np.ndarray) -> np.ndarray:
-        """Apply optimized spectrum averaging with reduced memory allocations."""
-        if self._spectrum_sum is None:
-            # Initialize accumulator array
-            self._spectrum_sum = np.zeros_like(spectrum, dtype=np.float64)
-            self.spectrum_history = []
+        """Apply optimized spectrum averaging with exponential moving average (PySDR pattern)."""
+        # Use exponential moving average for better performance and memory efficiency
+        if self._exponential_avg_buffer is None:
+            # Initialize with first spectrum
+            self._exponential_avg_buffer = spectrum.copy().astype(np.float32)
+            return spectrum
         
-        # Add new spectrum to history
-        self.spectrum_history.append(spectrum.copy())
+        # Exponential moving average: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
+        # Where alpha = 2 / (N + 1) for N-point moving average equivalent
+        alpha = self._ema_alpha
+        self._exponential_avg_buffer = alpha * spectrum + (1 - alpha) * self._exponential_avg_buffer
         
-        # Remove old spectrum if we exceed averaging count
-        if len(self.spectrum_history) > self.averaging:
-            old_spectrum = self.spectrum_history.pop(0)
-            # Update running sum efficiently
-            self._spectrum_sum += spectrum
-            self._spectrum_sum -= old_spectrum
-        else:
-            # Still building up history
-            self._spectrum_sum += spectrum
-        
-        # Return efficiently computed average
-        return (self._spectrum_sum / len(self.spectrum_history)).astype(np.float32)
+        return self._exponential_avg_buffer.copy()
     
     def compute_detailed_spectrum(self, iq_samples: np.ndarray) -> Optional[SpectrumData]:
         """Compute detailed spectrum analysis."""
@@ -383,8 +387,11 @@ class SignalProcessor:
             else:
                 fft_result = np.fft.fft(windowed_samples)
             
-            # Shift FFT result
-            fft_shifted = np.fft.fftshift(fft_result)
+            # Shift FFT result - use np.roll for power-of-2
+            if self._use_roll_for_shift:
+                fft_shifted = np.roll(fft_result, self.fft_size // 2)
+            else:
+                fft_shifted = np.fft.fftshift(fft_result)
             
             # Create frequency array
             freqs = np.fft.fftfreq(self.fft_size, 1/self.settings.sdr.sample_rate)
@@ -408,6 +415,63 @@ class SignalProcessor:
             
         except Exception as e:
             self.logger.error(f"Error computing detailed spectrum: {e}")
+            return None
+    
+    def compute_spectrogram_efficient(self, iq_samples: np.ndarray, 
+                                      overlap_factor: float = 0.5) -> Optional[np.ndarray]:
+        """
+        Compute spectrogram efficiently using PySDR row-by-row pattern.
+        
+        Args:
+            iq_samples: Input IQ samples
+            overlap_factor: Overlap factor (0-1), default 0.5 = 50% overlap
+            
+        Returns:
+            Spectrogram as 2D numpy array (time x frequency)
+        """
+        try:
+            overlap = int(self.fft_size * overlap_factor)
+            hop_size = self.fft_size - overlap
+            num_rows = (len(iq_samples) - self.fft_size) // hop_size + 1
+            
+            if num_rows <= 0:
+                return None
+            
+            # Pre-allocate spectrogram array
+            spectrogram = np.zeros((num_rows, self.fft_size), dtype=np.float32)
+            
+            # Compute row by row (PySDR pattern for efficiency)
+            for i in range(num_rows):
+                start_idx = i * hop_size
+                end_idx = start_idx + self.fft_size
+                
+                if end_idx > len(iq_samples):
+                    break
+                
+                # Extract segment and apply window
+                segment = iq_samples[start_idx:end_idx].astype(np.complex64)
+                windowed = segment * self.window
+                
+                # Compute FFT
+                if self.fft_method == 'pyfftw_optimized':
+                    self.fft_input[:] = windowed
+                    self.fft_object()
+                    fft_result = self.fft_output.copy()
+                else:
+                    fft_result = np.fft.fft(windowed)
+                
+                # Shift and convert to dB
+                if self._use_roll_for_shift:
+                    fft_shifted = np.roll(fft_result, self.fft_size // 2)
+                else:
+                    fft_shifted = np.fft.fftshift(fft_result)
+                
+                spectrogram[i, :] = 10 * np.log10(np.abs(fft_shifted)**2 + 1e-12)
+            
+            return spectrogram
+            
+        except Exception as e:
+            self.logger.error(f"Error computing spectrogram: {e}")
             return None
     
     def compute_signal_stats(self, iq_samples: np.ndarray) -> Optional[SignalStats]:

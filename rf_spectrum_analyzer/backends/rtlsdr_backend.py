@@ -150,17 +150,39 @@ class RTLSDRBackend(SDRBackend):
             return False
     
     def read_samples(self, num_samples: int) -> Optional[np.ndarray]:
-        """Read IQ samples from RTL-SDR with error handling."""
+        """
+        Read IQ samples from RTL-SDR with PySDR best practices.
+        
+        Implements:
+        - Discard initial samples to avoid transient effects
+        - Automatic DC offset removal
+        - Proper error handling
+        """
         if not self.sdr or not self.connected:
             return None
         
         try:
-            # Read samples with timeout protection
+            # Discard initial samples to avoid transient effects (PySDR best practice)
+            # This is especially important after frequency/gain changes
+            if not hasattr(self, '_initial_samples_discarded'):
+                discard_samples = min(2048, num_samples // 4)
+                try:
+                    _ = self.sdr.read_samples(discard_samples)
+                    self._initial_samples_discarded = True
+                    logger.debug(f"Discarded {discard_samples} initial samples")
+                except:
+                    pass  # Continue even if discard fails
+            
+            # Read actual samples with timeout protection
             samples = self.sdr.read_samples(num_samples)
             
             if samples is None or len(samples) == 0:
                 logger.warning("No samples received from RTL-SDR")
                 return None
+            
+            # Remove DC offset (PySDR best practice)
+            # Simple and efficient: samples = samples - np.mean(samples)
+            samples = samples - np.mean(samples)
             
             # Convert to complex64 for consistency
             return samples.astype(np.complex64)
@@ -194,7 +216,11 @@ class RTLSDRBackend(SDRBackend):
                 logger.error(f"Error canceling async read: {e}")
     
     def set_frequency(self, frequency: float) -> bool:
-        """Set center frequency with validation."""
+        """
+        Set center frequency with validation and PySDR best practices.
+        
+        After changing frequency, discard initial samples flag is reset.
+        """
         if not self.sdr:
             return False
         
@@ -208,6 +234,12 @@ class RTLSDRBackend(SDRBackend):
             
             self.sdr.center_freq = int(frequency)
             self.center_frequency = frequency
+            
+            # Reset initial samples flag (PySDR best practice)
+            # Need to discard samples after frequency change
+            if hasattr(self, '_initial_samples_discarded'):
+                delattr(self, '_initial_samples_discarded')
+            
             logger.debug(f"Frequency set to {frequency/1e6:.3f} MHz")
             return True
             
@@ -238,23 +270,33 @@ class RTLSDRBackend(SDRBackend):
             return False
     
     def set_gain(self, gain: float) -> bool:
-        """Set RF gain with validation."""
+        """
+        Set RF gain with validation and closest valid gain selection (PySDR best practice).
+        
+        RTL-SDR supports only discrete gain values. This finds the closest valid gain.
+        """
         if not self.sdr:
             return False
         
         try:
+            # Get valid gains and find closest (PySDR best practice)
             valid_gains = self.sdr.get_gains()
             if valid_gains:
-                # Find closest valid gain (RTL-SDR uses tenths of dB)
+                # RTL-SDR uses tenths of dB internally
                 gain_tenths = gain * 10
+                # Find closest valid gain
                 closest_gain = min(valid_gains, key=lambda x: abs(x - gain_tenths))
                 self.sdr.gain = closest_gain / 10.0
                 self.gain = closest_gain / 10.0
-                logger.debug(f"Gain set to {self.gain:.1f} dB")
+                logger.debug(f"Gain set to {self.gain:.1f} dB (closest valid gain)")
             else:
                 self.sdr.gain = gain
                 self.gain = gain
                 logger.debug(f"Gain set to {gain:.1f} dB")
+            
+            # Reset initial samples flag after gain change
+            if hasattr(self, '_initial_samples_discarded'):
+                delattr(self, '_initial_samples_discarded')
             
             return True
             

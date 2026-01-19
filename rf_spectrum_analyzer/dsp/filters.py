@@ -633,3 +633,131 @@ def design_bandstop(low_cutoff: float, high_cutoff: float, order: int = 5,
         return FIRFilter(**config.__dict__)
     else:
         return IIRFilter(**config.__dict__)
+
+
+def design_fm_deemphasis(sample_rate: float, time_constant: float = 75e-6,
+                        region: str = "americas") -> IIRFilter:
+    """
+    Design FM de-emphasis filter for FM audio (PySDR best practice).
+    
+    De-emphasis filter compensates for pre-emphasis applied at transmitter.
+    Standard time constants:
+    - Americas/Korea: 75μs
+    - Europe/Australia: 50μs
+    
+    Args:
+        sample_rate: Sample rate in Hz
+        time_constant: Time constant in seconds (75e-6 for Americas, 50e-6 for Europe)
+        region: "americas" (75μs) or "europe" (50μs)
+        
+    Returns:
+        IIRFilter configured as de-emphasis filter
+        
+    Example:
+        >>> # For US FM broadcast
+        >>> deemph = design_fm_deemphasis(48000, region="americas")
+        >>> audio_out = deemph.filter(fm_demodulated)
+    """
+    # Set time constant based on region if not explicitly specified
+    if time_constant == 75e-6:
+        if region.lower() in ["europe", "australia"]:
+            time_constant = 50e-6
+    elif region.lower() == "americas":
+        time_constant = 75e-6
+    elif region.lower() in ["europe", "australia"]:
+        time_constant = 50e-6
+    
+    # Design de-emphasis filter using bilinear transform
+    # Transfer function: H(s) = 1 / (1 + s*tau)
+    # where tau is the time constant
+    from scipy.signal import bilinear
+    
+    # Analog filter coefficients
+    b_analog = [1]
+    a_analog = [time_constant, 1]
+    
+    # Convert to digital using bilinear transform
+    b_digital, a_digital = bilinear(b_analog, a_analog, fs=sample_rate)
+    
+    # Create IIR filter
+    filter_obj = IIRFilter(b=b_digital, a=a_digital, sample_rate=sample_rate)
+    
+    logger.info(f"Created FM de-emphasis filter: tau={time_constant*1e6:.0f}μs, fs={sample_rate/1e3:.1f}kHz")
+    
+    return filter_obj
+
+
+def create_streaming_filter(b: np.ndarray, a: Union[float, np.ndarray] = 1.0) -> Dict[str, Any]:
+    """
+    Create streaming filter state for continuous operation (PySDR pattern).
+    
+    This uses scipy's lfilter_zi to maintain filter state between chunks,
+    enabling continuous filtering without transient artifacts.
+    
+    Args:
+        b: Numerator coefficients (FIR) or both for IIR
+        a: Denominator coefficients (IIR), default 1.0 for FIR
+        
+    Returns:
+        Dictionary with 'b', 'a', and 'zi' (filter state)
+        
+    Example:
+        >>> # Create streaming filter
+        >>> b = scipy.signal.firwin(64, 0.1)
+        >>> stream_filter = create_streaming_filter(b)
+        >>> 
+        >>> # Process chunks
+        >>> for chunk in data_chunks:
+        >>>     filtered, stream_filter['zi'] = scipy.signal.lfilter(
+        >>>         stream_filter['b'], stream_filter['a'], chunk, zi=stream_filter['zi'])
+    """
+    from scipy.signal import lfilter_zi
+    
+    # Ensure a is array
+    if isinstance(a, (int, float)):
+        a = np.array([a])
+    else:
+        a = np.array(a)
+    
+    b = np.array(b)
+    
+    # Initialize filter state
+    zi = lfilter_zi(b, a)
+    
+    return {
+        'b': b,
+        'a': a,
+        'zi': zi
+    }
+
+
+def apply_streaming_filter(stream_filter: Dict[str, Any], data: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Apply streaming filter to data chunk and update state.
+    
+    Args:
+        stream_filter: Filter dictionary from create_streaming_filter
+        data: Input data chunk
+        
+    Returns:
+        Tuple of (filtered_data, updated_filter_dict)
+        
+    Example:
+        >>> b = scipy.signal.firwin(64, 0.1)
+        >>> stream_filter = create_streaming_filter(b)
+        >>> 
+        >>> # Process first chunk
+        >>> filtered1, stream_filter = apply_streaming_filter(stream_filter, chunk1)
+        >>> 
+        >>> # Process second chunk (maintains continuity)
+        >>> filtered2, stream_filter = apply_streaming_filter(stream_filter, chunk2)
+    """
+    from scipy.signal import lfilter
+    
+    # Apply filter with state
+    filtered, zi_new = lfilter(stream_filter['b'], stream_filter['a'], data, zi=stream_filter['zi'])
+    
+    # Update state
+    stream_filter['zi'] = zi_new
+    
+    return filtered, stream_filter
