@@ -6,7 +6,9 @@ Coordinates GUI, SDR backend, and signal processing components.
 import sys
 import logging
 import numpy as np
-from typing import Optional, Dict, Any
+from collections import deque
+from threading import Lock
+from typing import Optional, Dict, Any, Deque
 from PySide6.QtWidgets import QMainWindow, QApplication
 from PySide6.QtCore import QTimer, QThread, Signal, QObject
 from PySide6.QtGui import QCloseEvent
@@ -68,10 +70,130 @@ class DataAcquisitionThread(QThread):
         finally:
             logger.info("Data acquisition thread stopped")
     
-    def stop(self):
-        """Stop the acquisition thread."""
+    def _cancel_backend_read(self):
+        """Ask backend to cancel any blocking read operation if supported."""
+        try:
+            backend = getattr(self.sdr_manager, 'backend', None)
+            if backend is None:
+                return
+
+            if hasattr(backend, 'cancel_read'):
+                backend.cancel_read()
+            elif hasattr(backend, 'stop_streaming'):
+                backend.stop_streaming()
+        except Exception as exc:
+            logger.debug(f"Backend cancel hook failed: {exc}")
+
+    def stop(self, wait_timeout_ms: int = 1500) -> bool:
+        """Stop the acquisition thread with bounded wait time."""
         self.running = False
-        self.wait()
+        self._cancel_backend_read()
+        return self.wait(wait_timeout_ms)
+
+
+class ProcessingThread(QThread):
+    """Background DSP worker with bounded latest-wins queue."""
+
+    processing_result = Signal(dict)
+    error_occurred = Signal(str)
+
+    def __init__(self, settings: Settings):
+        super().__init__()
+        self.settings = settings
+        self.signal_processor = SignalProcessor(settings)
+        self.running = False
+        self._queue: Deque[np.ndarray] = deque(maxlen=2)
+        self._queue_lock = Lock()
+        self._frame_count = 0
+
+        self.signal_processor.set_auto_detection(
+            getattr(settings.detection, 'auto_detection_enabled', False)
+        )
+        self.signal_processor.set_advanced_analysis(
+            getattr(settings.detection, 'advanced_analysis_enabled', False)
+        )
+
+    def submit_samples(self, samples: np.ndarray):
+        """Submit a frame for DSP processing with backpressure."""
+        if samples is None or len(samples) == 0:
+            return
+        with self._queue_lock:
+            self._queue.append(np.asarray(samples, dtype=np.complex64).copy())
+
+    def _get_next_samples(self) -> Optional[np.ndarray]:
+        with self._queue_lock:
+            if not self._queue:
+                return None
+            latest = self._queue[-1]
+            self._queue.clear()
+            return latest
+
+    def run(self):
+        """Run DSP processing loop in background thread."""
+        self.running = True
+        try:
+            while self.running:
+                samples = self._get_next_samples()
+                if samples is None:
+                    self.msleep(5)
+                    continue
+
+                spectrum = self.signal_processor.compute_spectrum(samples)
+
+                advanced_result = None
+                interval_frames = max(
+                    1,
+                    int(getattr(self.settings.detection, 'advanced_analysis_interval_frames', 10))
+                )
+                if (
+                    getattr(self.signal_processor, '_advanced_analysis_enabled', False)
+                    and self._frame_count % interval_frames == 0
+                ):
+                    advanced_result = self.signal_processor.process_complete_chain(samples)
+
+                self.processing_result.emit(
+                    {
+                        'iq_samples': samples,
+                        'spectrum': spectrum,
+                        'analysis_result': advanced_result,
+                        'frame_count': self._frame_count,
+                    }
+                )
+                self._frame_count += 1
+        except Exception as exc:
+            logger.error(f"Processing thread error: {exc}")
+            self.error_occurred.emit(str(exc))
+
+    def stop(self, wait_timeout_ms: int = 1500) -> bool:
+        """Stop the processing thread with bounded wait time."""
+        self.running = False
+        return self.wait(wait_timeout_ms)
+
+
+class AnalysisRequestThread(QThread):
+    """One-shot async thread for analysis requests from the spectrum widget."""
+
+    completed = Signal(dict)
+    error_occurred = Signal(str)
+
+    def __init__(self, sample_rate: float, iq_data: np.ndarray, center_freq: float, bandwidth: float):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.iq_data = np.asarray(iq_data, dtype=np.complex64)
+        self.center_freq = center_freq
+        self.bandwidth = bandwidth
+
+    def run(self):
+        try:
+            analyzer = SignalAnalyzer(self.sample_rate)
+            result = analyzer.analyze_signal_comprehensive(
+                self.iq_data,
+                self.center_freq,
+                self.bandwidth,
+            )
+            self.completed.emit(result)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
 
 
 class RFSpectrumAnalyzerApp(QObject):
@@ -88,18 +210,22 @@ class RFSpectrumAnalyzerApp(QObject):
         self.signal_analyzer = None
         self.main_window = None
         self.acquisition_thread = None
+        self.processing_thread = None
+        self.analysis_request_thread = None
         
         # Data buffers
-        self.iq_buffer = np.array([], dtype=np.complex64)
+        self.iq_snapshot_ring: Deque[np.ndarray] = deque(maxlen=64)
         self.spectrum_data = np.array([])
-        self.waterfall_data = []
+        self._latest_waterfall_line = None
         self.constellation_data = {
             'iq_samples': np.array([], dtype=np.complex64),
             'symbols': np.array([], dtype=np.complex64),
             'modulation_info': {}
         }
-        self.bitstream_data = np.array([], dtype=np.uint8)
+        self.bitstream_data: Deque[int] = deque(maxlen=10000)
+        self._bitstream_total_count = 0
         self._bitstream_gui_sent_count = 0
+        self.enable_async_analysis_requests = True
         
         # Demo mode
         self.demo_mode = getattr(settings, 'demo_mode', False)
@@ -169,6 +295,15 @@ class RFSpectrumAnalyzerApp(QObject):
             except Exception as e:
                 self.logger.error(f"Failed to initialize acquisition thread: {e}")
                 self.acquisition_thread = None
+
+            try:
+                self.processing_thread = ProcessingThread(self.settings)
+                self.processing_thread.processing_result.connect(self._on_processing_result)
+                self.processing_thread.error_occurred.connect(self.on_acquisition_error)
+                self.logger.info("Processing thread initialized successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize processing thread: {e}")
+                self.processing_thread = None
             
             # Setup demo mode if enabled
             if self.demo_mode:
@@ -283,19 +418,16 @@ class RFSpectrumAnalyzerApp(QObject):
         self.waterfall_timer.timeout.connect(self.update_waterfall_display)
         self.waterfall_timer.start(waterfall_interval)
         
-        # Constellation update timer
-        self.constellation_timer.timeout.connect(self.update_constellation_display)
-        self.constellation_timer.start(75)  # ~13 FPS
-        
-        # Bitstream update timer
-        self.bitstream_timer.timeout.connect(self.update_bitstream_display)
-        self.bitstream_timer.start(100)  # 10 FPS for bitstream
+        # Constellation and bitstream updates are driven by incremental data callbacks.
+        self.constellation_timer.stop()
+        self.bitstream_timer.stop()
     
     def start_acquisition(self):
         """Start SDR data acquisition."""
         try:
             self.logger.info("Starting SDR acquisition...")
             self._bitstream_gui_sent_count = 0
+            self._bitstream_total_count = 0
             
             # Connect to SDR device
             if not self.sdr_manager.is_connected() and not self.sdr_manager.connect():
@@ -312,6 +444,9 @@ class RFSpectrumAnalyzerApp(QObject):
             if self.acquisition_thread is None:
                 self.logger.error("Acquisition thread not initialized")
                 return False
+
+            if self.processing_thread and not self.processing_thread.isRunning():
+                self.processing_thread.start()
             
             self.acquisition_thread.start()
             
@@ -333,7 +468,16 @@ class RFSpectrumAnalyzerApp(QObject):
             
             # Stop acquisition thread
             if self.acquisition_thread and self.acquisition_thread.isRunning():
-                self.acquisition_thread.stop()
+                if not self.acquisition_thread.stop(wait_timeout_ms=1500):
+                    self.logger.warning("Acquisition thread did not stop within timeout")
+
+            if self.processing_thread and self.processing_thread.isRunning():
+                if not self.processing_thread.stop(wait_timeout_ms=1500):
+                    self.logger.warning("Processing thread did not stop within timeout")
+
+            if self.analysis_request_thread and self.analysis_request_thread.isRunning():
+                if not self.analysis_request_thread.wait(1000):
+                    self.logger.warning("Analysis request thread still running during stop")
             
             # Disconnect SDR
             if self.sdr_manager:
@@ -344,6 +488,10 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.main_window.set_acquisition_state(False)
 
             self._bitstream_gui_sent_count = 0
+            self._bitstream_total_count = 0
+            self.bitstream_data.clear()
+            self.iq_snapshot_ring.clear()
+            self._latest_waterfall_line = None
             
             self.logger.info("SDR acquisition stopped")
             
@@ -353,26 +501,36 @@ class RFSpectrumAnalyzerApp(QObject):
     def on_new_data(self, samples: np.ndarray):
         """Handle new IQ data from acquisition thread."""
         try:
-            # Append new samples to buffer
-            self.iq_buffer = np.concatenate([self.iq_buffer, samples])
-            
-            # Process data when we have enough samples
-            min_samples = self.settings.dsp.fft_size
-            if len(self.iq_buffer) >= min_samples:
-                self.process_iq_data()
+            if samples is None or len(samples) == 0:
+                return
+
+            self.iq_snapshot_ring.append(np.asarray(samples, dtype=np.complex64).copy())
+
+            # Keep sync processor state fresh for manual/sequential actions.
+            if self.signal_processor:
+                fft_size = self.settings.dsp.fft_size
+                self.signal_processor.update_current_data(samples[:fft_size])
+
+            if self.processing_thread and self.processing_thread.isRunning():
+                self.processing_thread.submit_samples(samples)
+            else:
+                self.process_iq_data(samples)
                 
         except Exception as e:
             self.logger.error(f"Error processing new data: {e}")
     
-    def process_iq_data(self):
+    def process_iq_data(self, samples: Optional[np.ndarray] = None):
         """Process IQ data to generate spectrum and constellation analysis."""
         try:
             if self.signal_processor is None:
                 return
+
+            if samples is None or len(samples) == 0:
+                return
             
             # Extract samples for processing
             fft_size = self.settings.dsp.fft_size
-            samples = self.iq_buffer[:fft_size]
+            samples = samples[:fft_size]
             
             # Update signal processor with current data for detection
             self.signal_processor.update_current_data(samples)
@@ -381,12 +539,7 @@ class RFSpectrumAnalyzerApp(QObject):
             spectrum = self.signal_processor.compute_spectrum(samples)
             if spectrum is not None:
                 self.spectrum_data = spectrum
-                
-                # Update waterfall data only when we have new spectrum
-                self.waterfall_data.append(spectrum.copy())
-                max_waterfall_lines = self.settings.gui.waterfall_height
-                if len(self.waterfall_data) > max_waterfall_lines:
-                    self.waterfall_data.pop(0)
+                self._latest_waterfall_line = spectrum.copy()
             
             # Process advanced analysis only when feature flag is enabled.
             interval_frames = max(
@@ -404,10 +557,6 @@ class RFSpectrumAnalyzerApp(QObject):
                     self.logger.error(f"Error in advanced analysis: {e}")
                     import traceback
                     self.logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Remove processed samples from buffer
-            overlap_samples = int(fft_size * self.settings.dsp.overlap)
-            self.iq_buffer = self.iq_buffer[fft_size - overlap_samples:]
             
             self.frame_count += 1
             
@@ -450,6 +599,32 @@ class RFSpectrumAnalyzerApp(QObject):
                         
         except Exception as e:
             self.logger.debug(f"Error in advanced analysis: {e}")
+
+    def _on_processing_result(self, result: Dict[str, Any]):
+        """Consume DSP worker outputs on UI thread."""
+        try:
+            spectrum = result.get('spectrum')
+            if spectrum is not None and len(spectrum) > 0:
+                self.spectrum_data = spectrum
+                self._latest_waterfall_line = spectrum.copy()
+
+            analysis_result = result.get('analysis_result')
+            iq_samples = result.get('iq_samples')
+            if analysis_result and iq_samples is not None and len(iq_samples) > 0:
+                if not analysis_result.get('success', False):
+                    if self.demo_mode:
+                        analysis_result = self._generate_demo_analysis_result()
+                    else:
+                        return
+
+                self.update_constellation_data(iq_samples, analysis_result)
+                self.update_bitstream_data(analysis_result)
+                if self.main_window:
+                    self.update_gui_widgets()
+
+            self.frame_count = result.get('frame_count', self.frame_count)
+        except Exception as exc:
+            self.logger.error(f"Error consuming processing result: {exc}")
     
     def _generate_demo_analysis_result(self) -> dict:
         """Generate demo analysis result for fallback."""
@@ -574,15 +749,12 @@ class RFSpectrumAnalyzerApp(QObject):
                         self.logger.warning(f"Could not convert data type {final_data.dtype} to binary")
                         return
                 
-                # Add to bitstream buffer
-                self.bitstream_data = np.concatenate([self.bitstream_data, binary_data])
-                
-                self.logger.debug(f"Added {len(binary_data)} bits to bitstream, total: {len(self.bitstream_data)}")
-                
-                # Limit buffer size
-                max_bits = 10000  # Keep last 10k bits
-                if len(self.bitstream_data) > max_bits:
-                    self.bitstream_data = self.bitstream_data[-max_bits:]
+                self.bitstream_data.extend(int(bit) for bit in binary_data.tolist())
+                self._bitstream_total_count += int(len(binary_data))
+
+                self.logger.debug(
+                    f"Added {len(binary_data)} bits to bitstream, buffered: {len(self.bitstream_data)}"
+                )
             else:
                 self.logger.debug(f"No final data to process, length: {len(final_data)}")
                     
@@ -614,14 +786,13 @@ class RFSpectrumAnalyzerApp(QObject):
                 bitstream_widget = self.main_window.bitstream_widget
                 if hasattr(bitstream_widget, 'add_bits') and len(self.bitstream_data) > 0:
                     # Send only incremental bits to avoid duplicate re-appends on timer updates.
-                    start_idx = min(self._bitstream_gui_sent_count, len(self.bitstream_data))
-                    if start_idx < len(self.bitstream_data):
-                        new_bits = self.bitstream_data[start_idx:]
-                        if len(new_bits) > 100:
-                            new_bits = new_bits[-100:]
-                            start_idx = len(self.bitstream_data) - len(new_bits)
-                        bitstream_widget.add_bits(new_bits)
-                        self._bitstream_gui_sent_count = start_idx + len(new_bits)
+                    unsent_count = max(0, self._bitstream_total_count - self._bitstream_gui_sent_count)
+                    if unsent_count > 0:
+                        send_count = min(unsent_count, 128, len(self.bitstream_data))
+                        new_bits = list(self.bitstream_data)[-send_count:] if send_count > 0 else []
+                        if new_bits:
+                            bitstream_widget.add_bits(new_bits)
+                        self._bitstream_gui_sent_count = self._bitstream_total_count
                         self.logger.debug(f"Updated bitstream with {len(new_bits)} new bits")
                     
         except Exception as e:
@@ -659,9 +830,9 @@ class RFSpectrumAnalyzerApp(QObject):
     
     def update_waterfall_display(self):
         """Update waterfall display in GUI."""
-        if self.main_window and len(self.waterfall_data) > 0:
-            waterfall_array = np.array(self.waterfall_data)
-            self.main_window.update_waterfall(waterfall_array)
+        if self.main_window and self._latest_waterfall_line is not None:
+            self.main_window.update_waterfall(self._latest_waterfall_line)
+            self._latest_waterfall_line = None
     
     def update_constellation_display(self):
         """Update constellation display in GUI."""
@@ -676,10 +847,8 @@ class RFSpectrumAnalyzerApp(QObject):
     
     def update_bitstream_display(self):
         """Update bitstream display in GUI."""
-        if self.main_window and len(self.bitstream_data) > 0:
-            # Send recent bits to the display
-            recent_bits = self.bitstream_data[-200:] if len(self.bitstream_data) > 200 else self.bitstream_data
-            self.main_window.update_bitstream(recent_bits)
+        # Intentionally unused: incremental path is handled by update_gui_widgets.
+        return
     
     def on_acquisition_error(self, error_message: str):
         """Handle acquisition errors."""
@@ -756,6 +925,8 @@ class RFSpectrumAnalyzerApp(QObject):
             # Update signal processor sample rate
             if self.signal_processor:
                 self.signal_processor.update_sample_rate(sample_rate)
+            if self.processing_thread and self.processing_thread.signal_processor:
+                self.processing_thread.signal_processor.update_sample_rate(sample_rate)
                 
         except Exception as e:
             self.logger.error(f"Error changing sample rate: {e}")
@@ -998,6 +1169,8 @@ class RFSpectrumAnalyzerApp(QObject):
         try:
             if hasattr(self, 'signal_processor') and self.signal_processor:
                 self.signal_processor.set_auto_detection(enabled)
+            if self.processing_thread and self.processing_thread.signal_processor:
+                self.processing_thread.signal_processor.set_auto_detection(enabled)
                 self.logger.info(f"Auto detection {'enabled' if enabled else 'disabled'}")
         except Exception as e:
             self.logger.error(f"Error toggling auto detection: {e}")
@@ -1007,6 +1180,8 @@ class RFSpectrumAnalyzerApp(QObject):
         try:
             if hasattr(self, 'signal_processor') and self.signal_processor:
                 self.signal_processor.set_advanced_analysis(enabled)
+            if self.processing_thread and self.processing_thread.signal_processor:
+                self.processing_thread.signal_processor.set_advanced_analysis(enabled)
                 self.logger.info(f"Advanced analysis {'enabled' if enabled else 'disabled'}")
         except Exception as e:
             self.logger.error(f"Error toggling advanced analysis: {e}")
@@ -1026,29 +1201,70 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.logger.warning("No IQ data available for analysis")
                 return
             
-            # Perform comprehensive signal analysis
-            if self.signal_analyzer:
-                analysis_results = self.signal_analyzer.analyze_signal_comprehensive(
+            if getattr(self, 'enable_async_analysis_requests', False):
+                if self.analysis_request_thread and self.analysis_request_thread.isRunning():
+                    self.logger.warning("Previous analysis request still running; skipping new request")
+                    return
+
+                self.analysis_request_thread = AnalysisRequestThread(
+                    self.settings.sdr.sample_rate,
                     iq_data,
                     analysis_request['center_freq'],
-                    analysis_request['bandwidth']
+                    analysis_request['bandwidth'],
                 )
-                payload = analysis_results.get('payload', analysis_results)
-                if not analysis_results.get('success', True):
-                    self.logger.warning(
-                        f"Signal analysis failed: {analysis_results.get('error', 'Unknown error')}"
-                    )
-                    return
-                
-                # Update GUI with analysis results
-                self._update_gui_with_analysis_results(payload)
-                
-                self.logger.info(f"Signal analysis completed: {payload.get('modulation', {}).get('type', 'Unknown')} detected")
+                self.analysis_request_thread.completed.connect(self._on_async_analysis_completed)
+                self.analysis_request_thread.error_occurred.connect(
+                    lambda msg: self.logger.error(f"Async analysis request error: {msg}")
+                )
+                self.analysis_request_thread.start()
             else:
-                self.logger.error("Signal analyzer not initialized")
+                self._analyze_signal_request_sync(
+                    iq_data,
+                    analysis_request['center_freq'],
+                    analysis_request['bandwidth'],
+                )
                 
         except Exception as e:
             self.logger.error(f"Error handling signal analysis request: {e}")
+
+    def _analyze_signal_request_sync(self, iq_data: np.ndarray, center_freq: float, bandwidth: float):
+        """Synchronous analysis path used in tests or fallback modes."""
+        if not self.signal_analyzer:
+            self.logger.error("Signal analyzer not initialized")
+            return
+
+        analysis_results = self.signal_analyzer.analyze_signal_comprehensive(
+            iq_data,
+            center_freq,
+            bandwidth,
+        )
+        payload = analysis_results.get('payload', analysis_results)
+        if not analysis_results.get('success', True):
+            self.logger.warning(
+                f"Signal analysis failed: {analysis_results.get('error', 'Unknown error')}"
+            )
+            return
+
+        self._update_gui_with_analysis_results(payload)
+        self.logger.info(
+            f"Signal analysis completed: {payload.get('modulation', {}).get('type', 'Unknown')} detected"
+        )
+
+    def _on_async_analysis_completed(self, analysis_results: Dict[str, Any]):
+        """Handle completion of async analysis requests."""
+        try:
+            payload = analysis_results.get('payload', analysis_results)
+            if not analysis_results.get('success', True):
+                self.logger.warning(
+                    f"Signal analysis failed: {analysis_results.get('error', 'Unknown error')}"
+                )
+                return
+            self._update_gui_with_analysis_results(payload)
+            self.logger.info(
+                f"Signal analysis completed: {payload.get('modulation', {}).get('type', 'Unknown')} detected"
+            )
+        except Exception as exc:
+            self.logger.error(f"Error handling async analysis completion: {exc}")
     
     def _get_iq_data_for_range(self, center_freq: float, bandwidth: float) -> Optional[np.ndarray]:
         """Get IQ data for specific frequency range."""
@@ -1056,35 +1272,29 @@ class RFSpectrumAnalyzerApp(QObject):
             if self.demo_mode:
                 # Generate synthetic IQ data for demo
                 return self._generate_demo_iq_data(center_freq, bandwidth)
-            
-            # For real SDR, we would need to tune to the frequency and capture data
-            if self.sdr_manager and self.sdr_manager.is_connected():
-                # Store current settings
-                original_freq = self.settings.sdr.center_frequency
-                
-                try:
-                    # Tune to target frequency
-                    self.sdr_manager.set_frequency(center_freq)
-                    
-                    # Capture IQ samples
-                    num_samples = int(self.settings.sdr.sample_rate * 0.1)  # 100ms of data
-                    iq_data = self.sdr_manager.read_samples(num_samples)
-                    
-                    # Restore original frequency
-                    self.sdr_manager.set_frequency(original_freq)
-                    
-                    return iq_data
-                    
-                except Exception as e:
-                    self.logger.error(f"Error capturing IQ data: {e}")
-                    # Restore frequency on error
-                    try:
-                        self.sdr_manager.set_frequency(original_freq)
-                    except:
-                        pass
-                    return None
-            
-            return None
+
+            # Snapshot path: avoid synchronous retune/read in UI thread.
+            snapshot_ring = getattr(self, 'iq_snapshot_ring', None)
+            if not snapshot_ring:
+                return None
+
+            required_samples = int(self.settings.sdr.sample_rate * 0.1)
+            chunks = []
+            collected = 0
+            for chunk in reversed(snapshot_ring):
+                chunks.append(chunk)
+                collected += len(chunk)
+                if collected >= required_samples:
+                    break
+
+            if not chunks:
+                return None
+
+            iq_data = np.concatenate(list(reversed(chunks))).astype(np.complex64)
+            if len(iq_data) > required_samples:
+                iq_data = iq_data[-required_samples:]
+
+            return iq_data
             
         except Exception as e:
             self.logger.error(f"Error getting IQ data for range: {e}")
@@ -1413,9 +1623,70 @@ class RFSpectrumAnalyzerApp(QObject):
         Args:
             mode: 'fast', 'balanced', or 'quality'
         """
+        self._apply_qos_profile(mode)
+
         if self.signal_processor:
             self.signal_processor.set_performance_mode(mode)
+        if self.processing_thread and self.processing_thread.signal_processor:
+            self.processing_thread.signal_processor.set_performance_mode(mode)
             self.logger.info(f"Performance mode set to: {mode}")
+
+    def _apply_qos_profile(self, mode: str):
+        """Apply cross-layer QoS knobs for DSP and rendering."""
+        profiles = {
+            'fast': {
+                'spectrum_rate': 12,
+                'waterfall_rate': 8,
+                'advanced_interval_frames': 20,
+                'constellation_max_points': 1200,
+                'constellation_autoscale_every': 20,
+                'bitstream_redraw_ms': 120,
+                'bitstream_max_render_bits': 8000,
+            },
+            'balanced': {
+                'spectrum_rate': 20,
+                'waterfall_rate': 12,
+                'advanced_interval_frames': 10,
+                'constellation_max_points': 2000,
+                'constellation_autoscale_every': 10,
+                'bitstream_redraw_ms': 100,
+                'bitstream_max_render_bits': 12000,
+            },
+            'quality': {
+                'spectrum_rate': 30,
+                'waterfall_rate': 18,
+                'advanced_interval_frames': 5,
+                'constellation_max_points': 3500,
+                'constellation_autoscale_every': 5,
+                'bitstream_redraw_ms': 60,
+                'bitstream_max_render_bits': 20000,
+            },
+        }
+
+        profile = profiles.get(mode)
+        if profile is None:
+            self.logger.warning(f"Unknown performance mode for QoS profile: {mode}")
+            return
+
+        self.settings.gui.spectrum_update_rate = profile['spectrum_rate']
+        self.settings.gui.waterfall_update_rate = profile['waterfall_rate']
+        self.settings.detection.advanced_analysis_interval_frames = profile['advanced_interval_frames']
+
+        self.spectrum_timer.setInterval(int(1000 / max(1, profile['spectrum_rate'])))
+        self.waterfall_timer.setInterval(int(1000 / max(1, profile['waterfall_rate'])))
+
+        if self.main_window and getattr(self.main_window, 'constellation_widget', None):
+            cw = self.main_window.constellation_widget
+            if hasattr(cw, 'settings'):
+                cw.settings['max_points'] = profile['constellation_max_points']
+                cw.settings['auto_scale_every_n_frames'] = profile['constellation_autoscale_every']
+
+        if self.main_window and getattr(self.main_window, 'bitstream_widget', None):
+            bw = self.main_window.bitstream_widget
+            if hasattr(bw, 'max_render_bits'):
+                bw.max_render_bits = profile['bitstream_max_render_bits']
+            if hasattr(bw, 'update_timer') and hasattr(bw.update_timer, 'setInterval'):
+                bw.update_timer.setInterval(profile['bitstream_redraw_ms'])
     
     def get_performance_stats(self) -> dict:
         """Get current performance statistics."""

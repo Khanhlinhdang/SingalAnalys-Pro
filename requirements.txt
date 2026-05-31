@@ -6,3 +6,6 @@ PySide6
 scikit-learn
 PyYAML
 sdrconnect
+sdr
+scikit-dsp-comm
+scikit-commpy

@@ -14,7 +14,7 @@ matplotlib>=3.5.0
 # Note: These may require additional system dependencies
 # pyspectrum>=0.1.0  # FFT and spectrum analysis - install if available
 # mhostetter/sdr - Install from GitHub: pip install git+https://github.com/mhostetter/sdr.git
-scikit-dsp-comm>=0.1.0  # Digital signal processing
+git+https://github.com/mwickert/scikit-dsp-comm.git#egg=scikit-dsp-comm  # Digital signal processing
 
 # Data Storage and Export
 h5py>=3.7.0

@@ -1,7 +1,7 @@
 {
-  "timestamp": 1780213463.6245923,
+  "timestamp": 1780214456.2431104,
   "overall_result": true,
-  "total_duration": 1.9369332790374756,
+  "total_duration": 2.790458917617798,
   "summary": {
     "total_tests": 11,
     "total_failures": 0,
@@ -16,7 +16,7 @@
       "failures": 0,
       "errors": 0,
       "skipped": 11,
-      "duration": 0.0003333091735839844,
+      "duration": 0.0004343986511230469,
       "success": true
     }
   },

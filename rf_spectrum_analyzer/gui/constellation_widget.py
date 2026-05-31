@@ -49,9 +49,12 @@ class ConstellationWidget(QWidget):
             "color_scheme": "default",
             "grid_enabled": True,
             "auto_scale": True,
+            "auto_scale_every_n_frames": 10,
             "zoom_factor": 1.0,
             "persistence_alpha": 0.7
         }
+
+        self._display_frame_counter = 0
         
         # Plot data
         self.iq_scatter = None
@@ -283,6 +286,7 @@ class ConstellationWidget(QWidget):
         """Update the constellation display."""
         try:
             mode = self.mode_combo.currentText()
+            self._display_frame_counter += 1
             
             # Clear all plots first
             self.iq_scatter.clear()
@@ -320,7 +324,10 @@ class ConstellationWidget(QWidget):
                 self.reference_scatter.setData(ref_i, ref_q)
             
             # Auto scale if enabled
-            if self.settings["auto_scale"]:
+            if (
+                self.settings["auto_scale"]
+                and self._display_frame_counter % max(1, int(self.settings.get("auto_scale_every_n_frames", 10))) == 0
+            ):
                 self.plot_widget.getViewBox().autoRange()
                 
         except Exception as e:

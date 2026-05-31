@@ -39,6 +39,7 @@ class BitstreamWidget(QWidget):
         # Display parameters
         self.bits_per_row = 32
         self.pixel_size = 6  # Smaller for more data density
+        self.max_render_bits = 12000
         self.bit_colors = {
             0: QColor(20, 20, 20),      # Dark gray for 0
             1: QColor(0, 255, 100)      # Bright green for 1
@@ -294,7 +295,7 @@ class BitstreamWidget(QWidget):
 
             # Batch updates for performance
             if not self.update_timer.isActive():
-                self.update_timer.start(50)  # Update every 50ms
+                self.update_timer.start(100)  # Fixed 10 FPS redraw budget
 
             # Update labels immediately for responsiveness
             self.update_labels()
@@ -324,8 +325,11 @@ class BitstreamWidget(QWidget):
                 self.display_widget.setPixmap(empty_pixmap)
                 return
 
+            # Render only the latest window to keep UI responsive for long captures.
+            render_buffer = self.bit_buffer[-self.max_render_bits:]
+
             # Calculate display dimensions
-            num_rows = (len(self.bit_buffer) + self.bits_per_row - 1) // self.bits_per_row
+            num_rows = (len(render_buffer) + self.bits_per_row - 1) // self.bits_per_row
             display_width = self.bits_per_row * self.pixel_size
             display_height = max(num_rows * self.pixel_size, 100)
 
@@ -337,7 +341,7 @@ class BitstreamWidget(QWidget):
             painter = QPainter(pixmap)
             painter.setRenderHint(QPainter.Antialiasing, False)  # Pixel perfect
 
-            for i, bit in enumerate(self.bit_buffer):
+            for i, bit in enumerate(render_buffer):
                 row = i // self.bits_per_row
                 col = i % self.bits_per_row
                 

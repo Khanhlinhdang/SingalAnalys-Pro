@@ -179,14 +179,13 @@ class WaterfallWidget(QWidget):
         if waterfall_data.size == 0:
             return
         
-        # Store data as list of 1D arrays
+        # Contract:
+        # - 1D input: append a single new spectrum line.
+        # - 2D input: treat as a full matrix replacement.
         if len(waterfall_data.shape) == 1:
-            # Single spectrum line
             self.waterfall_data.append(waterfall_data.copy())
         else:
-            # Multiple spectrum lines
-            for line in waterfall_data:
-                self.waterfall_data.append(line.copy())
+            self.waterfall_data = [line.copy() for line in waterfall_data]
         
         # Limit number of lines
         while len(self.waterfall_data) > self.max_lines:
