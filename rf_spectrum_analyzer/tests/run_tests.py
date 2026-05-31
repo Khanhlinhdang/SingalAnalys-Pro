@@ -45,6 +45,11 @@ except ImportError:
 TEST_MODULES = {
     'imports': 'test_imports',
     'contract_schema': 'test_contract_schema',
+    'output_adapters': 'test_output_adapters',
+    'protocol_plugins': 'test_protocol_plugins',
+    'meteor_decode_chain': 'test_meteor_decode_chain',
+    'decode_depth_stages': 'test_decode_depth_stages',
+    'decode_hypothesis_hooks': 'test_decode_hypothesis_and_hooks',
     'dsp_filters': 'test_dsp_filters',
     'dsp_modulation': 'test_dsp_modulation',
     'dsp_analysis': 'test_dsp_analysis',
@@ -54,14 +59,15 @@ TEST_MODULES = {
     'gui': 'test_gui',
     'integration': 'test_integration',
     'pipeline_e2e': 'test_pipeline_e2e',
+    'protocol_pipeline_e2e': 'test_protocol_pipeline_e2e',
     'app_layer_integration': 'test_app_layer_integration',
     'debug_performance': 'test_debug_performance'
 }
 
 # Test categories
 TEST_CATEGORIES = {
-    'fast': ['imports', 'contract_schema', 'dsp_filters', 'dsp_modulation', 'dsp_analysis', 'dsp_utils'],
-    'medium': ['core', 'backends', 'gui', 'pipeline_e2e', 'app_layer_integration'],
+    'fast': ['imports', 'contract_schema', 'output_adapters', 'protocol_plugins', 'meteor_decode_chain', 'decode_depth_stages', 'decode_hypothesis_hooks', 'dsp_filters', 'dsp_modulation', 'dsp_analysis', 'dsp_utils'],
+    'medium': ['core', 'backends', 'gui', 'pipeline_e2e', 'protocol_pipeline_e2e', 'app_layer_integration'],
     'slow': ['integration', 'debug_performance'],
     'all': list(TEST_MODULES.keys())
 }

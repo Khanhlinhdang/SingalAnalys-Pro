@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from scipy import signal, fft
 from scipy.stats import kurtosis, skew
 from rf_spectrum_analyzer.utils.schema import make_api_result
+from rf_spectrum_analyzer.dsp.output_adapters import extract_all_artifacts, normalize_artifact_contracts
+from rf_spectrum_analyzer.dsp.decode_stages import create_default_decode_depth_pipeline
+from rf_spectrum_analyzer.dsp.protocol_plugins import create_default_protocol_registry
+from rf_spectrum_analyzer.dsp.tdma_detector import TDMABurstDetector
 
 # Import advanced DSP capabilities
 try:
@@ -51,6 +55,7 @@ class DemodulationResult:
     snr: Optional[float] = None
     error_rate: Optional[float] = None
     decoded_data: Optional[bytes] = None
+    metrics: Optional[Dict[str, Any]] = None
 
 @dataclass
 class CodingAnalysisResult:
@@ -67,6 +72,11 @@ class SignalAnalyzer:
     def __init__(self, sample_rate: float = 1e6):
         self.sample_rate = sample_rate
         self.logger = logger
+        self.decode_depth_pipeline = create_default_decode_depth_pipeline()
+        self.protocol_registry = create_default_protocol_registry()
+        self.tdma_detector = TDMABurstDetector(sample_rate)
+        self.modulation_score_history: List[Dict[str, Any]] = []
+        self.coding_score_history: List[Dict[str, Any]] = []
         
         # Analysis parameters
         self.fft_size = 1024
@@ -171,6 +181,66 @@ class SignalAnalyzer:
             coding_result = None
             if demod_result.success and demod_result.bits is not None:
                 coding_result = self._analyze_coding_advanced(demod_result.bits)
+
+            decoded_bits_pre_stage = self._select_best_decoded_bits(demod_result, coding_result)
+            decode_depth = self._run_decode_depth_stages(
+                decoded_bits=decoded_bits_pre_stage,
+                modulation_type=mod_result.modulation_type,
+                protocol_hint=None,
+            )
+            decoded_bits_stage = decode_depth.get('output_bits')
+            dechannelization = self._run_dechannelization_hooks(
+                iq_data=preprocessed_data,
+                decoded_bits=decoded_bits_stage,
+                modulation_type=mod_result.modulation_type,
+            )
+            decoded_bits = dechannelization.get('output_bits')
+            demod_audio = self._select_demod_audio(demod_result)
+            output_artifacts = extract_all_artifacts(
+                decoded_bits=decoded_bits,
+                demodulated_audio=demod_audio,
+                sample_rate=self.sample_rate,
+            )
+            protocol_outputs = self._run_protocol_decode(
+                decoded_bits=decoded_bits,
+                modulation_type=mod_result.modulation_type,
+                center_freq=center_freq,
+                demod_audio=demod_audio,
+            )
+            protocol_artifacts = protocol_outputs.get('artifacts', [])
+            if protocol_artifacts:
+                output_artifacts.extend(protocol_artifacts)
+
+            output_artifacts = normalize_artifact_contracts(output_artifacts)
+
+            decode_quality = self._calculate_decode_quality_metrics(
+                demod_result=demod_result,
+                decoded_bits=decoded_bits,
+                output_artifacts=output_artifacts,
+                protocol_outputs=protocol_outputs,
+            )
+            stage_telemetry = self._build_stage_telemetry(
+                iq_data=iq_data,
+                preprocessed_data=preprocessed_data,
+                detection_result=detection_result,
+                mod_result=mod_result,
+                demod_result=demod_result,
+                decode_depth=decode_depth,
+                dechannelization=dechannelization,
+                decode_quality=decode_quality,
+                protocol_outputs=protocol_outputs,
+                output_artifacts=output_artifacts,
+                bandwidth=bandwidth,
+                center_freq=center_freq,
+            )
+            stage_errors = self._build_stage_errors(
+                detection_result=detection_result,
+                mod_result=mod_result,
+                demod_result=demod_result,
+                decode_quality=decode_quality,
+                protocol_outputs=protocol_outputs,
+                stage_telemetry=stage_telemetry,
+            )
             
             # Step 6: Enhanced signal quality metrics
             quality_metrics = self._calculate_signal_quality_metrics(preprocessed_data, demod_result)
@@ -217,6 +287,25 @@ class SignalAnalyzer:
                     'points': mod_result.constellation_points.tolist() if mod_result.constellation_points is not None else [],
                     'symbols': demod_result.symbols.tolist() if demod_result.symbols is not None else []
                 },
+                'decoded_outputs': output_artifacts,
+                'decode_depth': decode_depth.get('metrics', {}),
+                'dechannelization': dechannelization.get('metrics', {}),
+                'decode_quality': decode_quality,
+                'stage_telemetry': stage_telemetry,
+                'stage_errors': stage_errors,
+                'protocol_outputs': protocol_outputs,
+                'stage_status': {
+                    'capture': 'implemented',
+                    'preprocess': 'implemented',
+                    'detection': 'implemented',
+                    'modulation_recognition': 'implemented',
+                    'demodulation': 'implemented' if demod_result.success else 'failed',
+                    'dechannelization': 'implemented' if dechannelization.get('metrics', {}).get('hook_executed', False) else 'partial',
+                    'deinterleave_descramble': 'implemented' if decode_depth.get('metrics', {}).get('input_bits', 0) > 0 else 'partial',
+                    'fec_decode': 'partial' if coding_result else 'planned',
+                    'protocol_parse': 'implemented' if protocol_outputs.get('matched_protocol') else 'partial',
+                    'output_adapters': 'implemented',
+                },
                 'spectrum_analysis': peaks_info,
                 'advanced_features_used': self.advanced_features_enabled,
                 'analysis_status': 'success'
@@ -240,6 +329,398 @@ class SignalAnalyzer:
                 meta={'api': 'SignalAnalyzer.analyze_signal_comprehensive'},
                 **payload,
             )
+
+    def _select_best_decoded_bits(
+        self,
+        demod_result: DemodulationResult,
+        coding_result: Optional[CodingAnalysisResult],
+    ) -> Optional[np.ndarray]:
+        """Pick the best available bitstream for payload extraction."""
+        if coding_result and coding_result.decoded_bits is not None:
+            return np.asarray(coding_result.decoded_bits)
+        if demod_result and demod_result.bits is not None:
+            return np.asarray(demod_result.bits)
+        if demod_result and demod_result.decoded_data is not None:
+            return np.asarray(demod_result.decoded_data)
+        return None
+
+    def _select_demod_audio(self, demod_result: DemodulationResult) -> Optional[np.ndarray]:
+        """Extract demodulated audio-like stream when available."""
+        if demod_result is None or getattr(demod_result, 'decoded_data', None) is None:
+            return None
+
+        data = demod_result.decoded_data
+        if isinstance(data, np.ndarray):
+            return data
+        return None
+
+    def _run_protocol_decode(
+        self,
+        decoded_bits: Optional[np.ndarray],
+        modulation_type: Optional[str],
+        center_freq: Optional[float],
+        demod_audio: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch protocol parsing through plugin registry."""
+        try:
+            return self.protocol_registry.decode(
+                bits=decoded_bits,
+                modulation_type=modulation_type,
+                sample_rate=self.sample_rate,
+                center_freq=center_freq,
+                auxiliary_signal=demod_audio,
+            )
+        except Exception as e:
+            self.logger.warning(f"Protocol decode failed: {e}")
+            return {
+                'matched_protocol': None,
+                'confidence': 0.0,
+                'results': [],
+                'artifacts': [],
+                'candidates': [],
+                'error': str(e),
+            }
+
+    def _run_dechannelization_hooks(
+        self,
+        iq_data: np.ndarray,
+        decoded_bits: Optional[np.ndarray],
+        modulation_type: Optional[str],
+    ) -> Dict[str, Any]:
+        """Run TDMA/FDMA strategy hooks before protocol parsing."""
+        if decoded_bits is None:
+            return {
+                'output_bits': None,
+                'metrics': {
+                    'hook_executed': False,
+                    'selected_strategy': 'none',
+                    'strategy_scores': {'none': 1.0, 'tdma': 0.0, 'fdma': 0.0},
+                    'burst_count': 0,
+                    'peak_count': 0,
+                },
+            }
+
+        tdma_score = 0.0
+        burst_count = 0
+        try:
+            bursts = self.tdma_detector.detect_bursts(iq_data, method='correlation')
+            burst_count = len(bursts)
+            if burst_count > 0:
+                tdma_score = min(0.95, 0.25 + 0.2 * burst_count)
+        except Exception as e:
+            self.logger.debug(f"TDMA hook detection failed: {e}")
+
+        peak_count = 0
+        fdma_score = 0.0
+        try:
+            if len(iq_data) > 16:
+                fft_data = np.fft.fftshift(np.fft.fft(iq_data, min(len(iq_data), 2048)))
+                psd = 20 * np.log10(np.abs(fft_data) + 1e-12)
+                median = float(np.median(psd))
+                threshold = median + 8.0
+                peak_count = int(np.sum(psd > threshold))
+                if peak_count > 10:
+                    fdma_score = min(0.9, 0.2 + 0.01 * peak_count)
+        except Exception as e:
+            self.logger.debug(f"FDMA hook detection failed: {e}")
+
+        strategy_scores = {
+            'none': 0.2,
+            'tdma': float(tdma_score),
+            'fdma': float(fdma_score),
+        }
+        selected_strategy = max(strategy_scores, key=strategy_scores.get)
+
+        return {
+            'output_bits': np.asarray(decoded_bits),
+            'metrics': {
+                'hook_executed': True,
+                'selected_strategy': selected_strategy,
+                'strategy_scores': strategy_scores,
+                'burst_count': int(burst_count),
+                'peak_count': int(peak_count),
+                'modulation_type': modulation_type,
+            },
+        }
+
+    def _run_decode_depth_stages(
+        self,
+        decoded_bits: Optional[np.ndarray],
+        modulation_type: Optional[str],
+        protocol_hint: Optional[str],
+    ) -> Dict[str, Any]:
+        """Run standardized bit-level decode stages before protocol parsing."""
+        if decoded_bits is None:
+            return {
+                'output_bits': None,
+                'metrics': {
+                    'input_bits': 0,
+                    'output_bits': 0,
+                    'length_delta_ratio': 0.0,
+                    'deinterleave_applied': False,
+                    'descramble_applied': False,
+                    'operations_count': 0,
+                    'confidence': 0.0,
+                    'operations_applied': [],
+                },
+            }
+
+        try:
+            stage_result = self.decode_depth_pipeline.process(
+                bits=decoded_bits,
+                modulation_type=modulation_type,
+                protocol_hint=protocol_hint,
+            )
+            input_len = int(len(np.asarray(decoded_bits).flatten()))
+            metrics = stage_result.to_metrics(input_len=input_len)
+            metrics['operations_applied'] = stage_result.operations_applied
+            return {
+                'output_bits': stage_result.output_bits,
+                'metrics': metrics,
+            }
+        except Exception as e:
+            self.logger.warning(f"Decode depth stages failed: {e}")
+            safe_bits = np.asarray(decoded_bits) if decoded_bits is not None else None
+            return {
+                'output_bits': safe_bits,
+                'metrics': {
+                    'input_bits': int(len(safe_bits)) if safe_bits is not None else 0,
+                    'output_bits': int(len(safe_bits)) if safe_bits is not None else 0,
+                    'length_delta_ratio': 0.0,
+                    'deinterleave_applied': False,
+                    'descramble_applied': False,
+                    'operations_count': 0,
+                    'confidence': 0.0,
+                    'operations_applied': [],
+                    'error': str(e),
+                },
+            }
+
+    def _calculate_decode_quality_metrics(
+        self,
+        demod_result: DemodulationResult,
+        decoded_bits: Optional[np.ndarray],
+        output_artifacts: List[Dict[str, Any]],
+        protocol_outputs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Aggregate decode quality indicators for dashboard/reporting."""
+        bit_count = int(len(decoded_bits)) if decoded_bits is not None else 0
+        artifacts_count = int(len(output_artifacts)) if output_artifacts else 0
+
+        protocol_results = protocol_outputs.get('results', []) if protocol_outputs else []
+        frame_count = int(len(protocol_results))
+        uncertain_frames = int(sum(1 for item in protocol_results if item.get('is_uncertain')))
+        uncertain_ratio = float(uncertain_frames / frame_count) if frame_count > 0 else 0.0
+        protocol_counters = self._extract_protocol_counters(protocol_outputs, protocol_results)
+
+        return {
+            'bit_count': bit_count,
+            'artifact_count': artifacts_count,
+            'protocol_matched': bool(protocol_outputs.get('matched_protocol')) if protocol_outputs else False,
+            'protocol_confidence': float(protocol_outputs.get('confidence', 0.0)) if protocol_outputs else 0.0,
+            'frame_count': frame_count,
+            'uncertain_frame_count': uncertain_frames,
+            'uncertain_frame_ratio': uncertain_ratio,
+            'snr_db': float(demod_result.snr) if demod_result and demod_result.snr is not None else None,
+            'ber': protocol_counters.get('ber'),
+            'per': protocol_counters.get('per'),
+            'crc_ok_rate': protocol_counters.get('crc_ok_rate'),
+            'frame_lock_ratio': protocol_counters.get('frame_lock_ratio'),
+        }
+
+    def _build_stage_telemetry(
+        self,
+        iq_data: np.ndarray,
+        preprocessed_data: np.ndarray,
+        detection_result: Dict[str, Any],
+        mod_result: ModulationAnalysisResult,
+        demod_result: DemodulationResult,
+        decode_depth: Dict[str, Any],
+        dechannelization: Dict[str, Any],
+        decode_quality: Dict[str, Any],
+        protocol_outputs: Dict[str, Any],
+        output_artifacts: List[Dict[str, Any]],
+        bandwidth: float,
+        center_freq: float,
+    ) -> Dict[str, Any]:
+        """Create stage-by-stage telemetry for the practical decode pipeline."""
+        demod_metrics = demod_result.metrics or {}
+        protocol_results = protocol_outputs.get('results', []) if isinstance(protocol_outputs, dict) else []
+        artifact_types = sorted({str(item.get('type', 'unknown')) for item in output_artifacts or []})
+
+        return {
+            'capture': {
+                'center_freq': float(center_freq),
+                'bandwidth': float(bandwidth),
+                'sample_rate': float(self.sample_rate),
+                'signal_length': int(len(iq_data)),
+                'signal_power': float(np.mean(np.abs(iq_data) ** 2)) if len(iq_data) > 0 else 0.0,
+            },
+            'preprocess': {
+                'input_length': int(len(iq_data)),
+                'output_length': int(len(preprocessed_data)),
+                'output_power': float(np.mean(np.abs(preprocessed_data) ** 2)) if len(preprocessed_data) > 0 else 0.0,
+            },
+            'detection': {
+                'signal_detected': bool(detection_result.get('signal_detected', True)),
+                'confidence': float(detection_result.get('confidence', 0.0)),
+                'snr_estimate': detection_result.get('snr_estimate'),
+                'noise_floor': detection_result.get('noise_floor'),
+            },
+            'modulation': {
+                'type': mod_result.modulation_type,
+                'confidence': float(mod_result.confidence),
+                'symbol_rate': mod_result.symbol_rate,
+                'frequency_offset': mod_result.frequency_offset,
+                'phase_offset': mod_result.phase_offset,
+                'hypotheses': mod_result.parameters.get('modulation_hypotheses', []),
+            },
+            'sync': {
+                'cfo_hz': demod_metrics.get('cfo_hz'),
+                'timing_error_rms': demod_metrics.get('timing_error_rms'),
+                'carrier_lock': demod_metrics.get('carrier_lock'),
+                'timing_lock': demod_metrics.get('timing_lock'),
+                'lock_confidence': demod_metrics.get('lock_confidence'),
+                'snr_db': demod_metrics.get('snr_db', demod_result.snr),
+                'evm': demod_metrics.get('evm'),
+            },
+            'demodulation': {
+                'success': bool(demod_result.success),
+                'bits_count': int(len(demod_result.bits)) if demod_result.bits is not None else 0,
+                'symbols_count': int(len(demod_result.symbols)) if demod_result.symbols is not None else 0,
+                'error_rate': demod_result.error_rate,
+                'snr': demod_result.snr,
+            },
+            'decode_depth': {
+                **dict(decode_depth.get('metrics', {}) or {}),
+                'operations_applied': decode_depth.get('metrics', {}).get('operations_applied', []),
+            },
+            'dechannelization': dict(dechannelization.get('metrics', {}) or {}),
+            'fec_decode': {
+                'bit_count': int(decode_quality.get('bit_count', 0)),
+                'ber': decode_quality.get('ber'),
+                'per': decode_quality.get('per'),
+                'crc_ok_rate': decode_quality.get('crc_ok_rate'),
+                'frame_lock_ratio': decode_quality.get('frame_lock_ratio'),
+            },
+            'protocol': {
+                'matched_protocol': protocol_outputs.get('matched_protocol'),
+                'confidence': float(protocol_outputs.get('confidence', 0.0)) if protocol_outputs else 0.0,
+                'frame_count': int(len(protocol_results)),
+            },
+            'output': {
+                'artifact_count': int(len(output_artifacts)),
+                'artifact_types': artifact_types,
+            },
+        }
+
+    def _build_stage_errors(
+        self,
+        detection_result: Dict[str, Any],
+        mod_result: ModulationAnalysisResult,
+        demod_result: DemodulationResult,
+        decode_quality: Dict[str, Any],
+        protocol_outputs: Dict[str, Any],
+        stage_telemetry: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Summarize stage-specific errors and partial failures."""
+        errors: List[Dict[str, Any]] = []
+
+        if not detection_result.get('signal_detected', True):
+            errors.append({
+                'stage': 'detection',
+                'class': 'no_signal',
+                'message': 'Signal presence detector did not confirm a lockable source.',
+            })
+
+        if not demod_result.success:
+            errors.append({
+                'stage': 'demodulation',
+                'class': 'demodulation_failed',
+                'message': 'Digital demodulation did not produce usable symbols or bits.',
+            })
+
+        if protocol_outputs and protocol_outputs.get('error'):
+            errors.append({
+                'stage': 'protocol_parse',
+                'class': 'protocol_decode_error',
+                'message': str(protocol_outputs.get('error')),
+            })
+
+        if decode_quality.get('bit_count', 0) == 0 and demod_result.success:
+            errors.append({
+                'stage': 'fec_decode',
+                'class': 'no_payload_bits',
+                'message': 'Demodulation succeeded but no recoverable payload bits were emitted.',
+            })
+
+        if stage_telemetry.get('sync', {}).get('carrier_lock') is False:
+            errors.append({
+                'stage': 'sync',
+                'class': 'carrier_unlock',
+                'message': 'Carrier lock confidence is below the stable threshold.',
+            })
+
+        if stage_telemetry.get('protocol', {}).get('matched_protocol') is None and decode_quality.get('bit_count', 0) > 0:
+            errors.append({
+                'stage': 'protocol_parse',
+                'class': 'no_protocol_match',
+                'message': 'Recovered bits were not matched to a known protocol plugin.',
+            })
+
+        return errors
+
+    def _extract_protocol_counters(
+        self,
+        protocol_outputs: Optional[Dict[str, Any]],
+        protocol_results: List[Dict[str, Any]],
+    ) -> Dict[str, Optional[float]]:
+        """Extract BER/PER/CRC/frame-lock counters when protocol decoder provides them."""
+        counters: Dict[str, Optional[float]] = {
+            'ber': None,
+            'per': None,
+            'crc_ok_rate': None,
+            'frame_lock_ratio': None,
+        }
+        if not protocol_outputs:
+            return counters
+
+        # Direct counters from protocol outputs (preferred when present)
+        for key in ('ber', 'per', 'crc_ok_rate', 'frame_lock_ratio'):
+            if key in protocol_outputs and protocol_outputs.get(key) is not None:
+                try:
+                    counters[key] = float(protocol_outputs.get(key))
+                except Exception:
+                    pass
+
+        # Derive BER from frame-level fields when available
+        if counters['ber'] is None and protocol_results:
+            ber_values = [float(item.get('ber')) for item in protocol_results if item.get('ber') is not None]
+            if ber_values:
+                counters['ber'] = float(np.mean(ber_values) / 100.0 if np.max(ber_values) > 1.0 else np.mean(ber_values))
+
+        # Derive PER from uncertain/error frames
+        if counters['per'] is None and protocol_results:
+            error_like = sum(1 for item in protocol_results if item.get('is_uncertain') or item.get('crc_ok') is False)
+            counters['per'] = float(error_like / max(1, len(protocol_results)))
+
+        # Derive CRC OK rate
+        if counters['crc_ok_rate'] is None and protocol_results:
+            crc_items = [item.get('crc_ok') for item in protocol_results if item.get('crc_ok') is not None]
+            if crc_items:
+                crc_ok = sum(1 for x in crc_items if bool(x))
+                counters['crc_ok_rate'] = float(crc_ok / len(crc_items))
+
+        # Derive frame lock ratio
+        if counters['frame_lock_ratio'] is None:
+            if protocol_outputs.get('frame_locks') is not None and protocol_outputs.get('frame_total') is not None:
+                total = max(1, int(protocol_outputs.get('frame_total')))
+                counters['frame_lock_ratio'] = float(int(protocol_outputs.get('frame_locks')) / total)
+            elif protocol_results:
+                # If frames exist, treat parser lock as 1.0 for now.
+                counters['frame_lock_ratio'] = 1.0
+
+        return counters
     
     def _preprocess_signal(self, iq_data: np.ndarray) -> np.ndarray:
         """Preprocess IQ data for analysis."""
@@ -325,34 +806,51 @@ class SignalAnalyzer:
     
     def _analyze_modulation_advanced(self, iq_data: np.ndarray) -> ModulationAnalysisResult:
         """Enhanced modulation analysis using advanced algorithms."""
+        candidates: List[Dict[str, Any]] = []
+
         if self.advanced_features_enabled and hasattr(self, 'modulation_analyzer'):
             try:
-                # Use advanced modulation analyzer
-                mod_result = self.modulation_analyzer.detect_modulation(iq_data)
-                
-                # Handle different possible key names
-                modulation_type = mod_result.get('modulation_type') or mod_result.get('type', 'Unknown')
-                confidence = mod_result.get('confidence', 0.0)
-                
-                # If advanced analyzer fails to provide good results, fallback to basic
-                if modulation_type == 'Unknown' or confidence < 0.1:
-                    self.logger.info("Advanced modulation analyzer returned low confidence, using basic analyzer")
-                    return self.analyze_modulation(iq_data)
-                
-                return ModulationAnalysisResult(
-                    modulation_type=modulation_type,
-                    confidence=confidence,
-                    parameters=mod_result.get('parameters', {}),
-                    constellation_points=self._extract_constellation_advanced(iq_data),
-                    symbol_rate=mod_result.get('symbol_rate'),
-                    frequency_offset=mod_result.get('frequency_offset'),
-                    phase_offset=mod_result.get('phase_offset', 0.0)
-                )
+                advanced = self.modulation_analyzer.detect_modulation(iq_data)
+                adv_type = advanced.get('modulation_type') or advanced.get('type', 'Unknown')
+                adv_conf = float(advanced.get('confidence', 0.0))
+                if adv_type and adv_type != 'Unknown':
+                    candidates.append({'type': adv_type, 'score': adv_conf, 'source': 'advanced_analyzer'})
             except Exception as e:
                 self.logger.warning(f"Advanced modulation analysis failed: {e}")
-        
-        # Fallback to basic modulation analysis
-        return self.analyze_modulation(iq_data)
+
+        basic = self.analyze_modulation(iq_data)
+        if basic.modulation_type and basic.modulation_type != 'Unknown':
+            candidates.append({'type': basic.modulation_type, 'score': float(basic.confidence), 'source': 'basic_analyzer'})
+
+        for mod_type, score in basic.parameters.get('modulation_scores', {}).items():
+            candidates.append({'type': mod_type, 'score': float(score), 'source': 'basic_scores'})
+
+        ranked = self._rank_hypotheses(candidates)
+        if not ranked:
+            return basic
+
+        selected = ranked[0]
+        self._push_score_history(
+            self.modulation_score_history,
+            {
+                'selected': selected,
+                'ranked': ranked[:5],
+            },
+        )
+
+        merged_parameters = dict(basic.parameters)
+        merged_parameters['modulation_hypotheses'] = ranked[:5]
+        merged_parameters['modulation_score_history'] = self.modulation_score_history[-10:]
+
+        return ModulationAnalysisResult(
+            modulation_type=selected['type'],
+            confidence=float(selected['score']),
+            parameters=merged_parameters,
+            constellation_points=self._extract_constellation_advanced(iq_data),
+            symbol_rate=basic.symbol_rate,
+            frequency_offset=basic.frequency_offset,
+            phase_offset=basic.phase_offset,
+        )
     
     def _extract_constellation_advanced(self, iq_data: np.ndarray, decimation: int = 10) -> np.ndarray:
         """Enhanced constellation extraction with timing recovery."""
@@ -420,8 +918,10 @@ class SignalAnalyzer:
                     success=demod_result.get('success', False),
                     symbols=demod_result.get('symbols'),
                     bits=demod_result.get('bits'),
-                    snr=demod_result.get('snr'),
-                    error_rate=demod_result.get('error_rate')
+                    snr=demod_result.get('snr', demod_result.get('snr_db', demod_result.get('snr_estimate'))),
+                    error_rate=demod_result.get('error_rate', demod_result.get('ber_estimate')),
+                    decoded_data=demod_result.get('demodulated_data'),
+                    metrics=demod_result,
                 )
                 
                 # If advanced demodulation was successful, return it
@@ -438,36 +938,128 @@ class SignalAnalyzer:
     
     def _analyze_coding_advanced(self, bits: np.ndarray) -> Optional[CodingAnalysisResult]:
         """Advanced coding analysis using FEC detection."""
+        base_result = self.analyze_coding(bits)
+        candidates: List[Dict[str, Any]] = []
+
+        if base_result is not None:
+            candidates.append(
+                {
+                    'coding_type': base_result.coding_type,
+                    'score': float(base_result.confidence),
+                    'decoded_bits': base_result.decoded_bits,
+                    'source': 'basic_coding',
+                    'parameters': dict(base_result.parameters),
+                }
+            )
+
         if self.advanced_features_enabled and hasattr(self, 'decoding_engine'):
             try:
-                # Try multiple coding schemes
-                coding_types = ['hamming', 'convolutional', 'bch', 'manchester', 'nrz']
-                best_result = None
-                best_confidence = 0.0
-                
+                coding_types = ['Hamming', 'Convolutional', 'BCH', 'Reed-Solomon', 'LDPC', 'Turbo']
                 for coding_type in coding_types:
                     try:
                         decode_result = self.decoding_engine.decode(bits, coding_type)
-                        if decode_result.get('confidence', 0) > best_confidence:
-                            best_confidence = decode_result.get('confidence', 0)
-                            best_result = CodingAnalysisResult(
-                                coding_type=coding_type,
-                                confidence=best_confidence,
-                                parameters=decode_result.get('parameters', {}),
-                                decoded_bits=decode_result.get('decoded_bits'),
-                                error_correction_info=decode_result.get('error_correction_info')
-                            )
+                        score = self._score_coding_hypothesis(decode_result)
+                        candidates.append(
+                            {
+                                'coding_type': coding_type,
+                                'score': score,
+                                'decoded_bits': decode_result.get('decoded_data'),
+                                'source': 'advanced_decode_engine',
+                                'parameters': {
+                                    'error_rate': decode_result.get('error_rate'),
+                                    'corrected_errors': decode_result.get('corrected_errors'),
+                                },
+                            }
+                        )
                     except Exception:
                         continue
-                
-                if best_result and best_confidence > 0.5:
-                    return best_result
-                    
             except Exception as e:
                 self.logger.warning(f"Advanced coding analysis failed: {e}")
-        
-        # Fallback to basic coding analysis
-        return self.analyze_coding(bits)
+
+        if not candidates:
+            return base_result
+
+        ranked = sorted(candidates, key=lambda x: float(x.get('score', 0.0)), reverse=True)
+        selected = ranked[0]
+        self._push_score_history(
+            self.coding_score_history,
+            {
+                'selected': {
+                    'coding_type': selected.get('coding_type'),
+                    'score': float(selected.get('score', 0.0)),
+                },
+                'ranked': [
+                    {
+                        'coding_type': item.get('coding_type'),
+                        'score': float(item.get('score', 0.0)),
+                        'source': item.get('source'),
+                    }
+                    for item in ranked[:6]
+                ],
+            },
+        )
+
+        params = dict(selected.get('parameters') or {})
+        params['coding_hypotheses'] = [
+            {
+                'coding_type': item.get('coding_type'),
+                'score': float(item.get('score', 0.0)),
+                'source': item.get('source'),
+            }
+            for item in ranked[:6]
+        ]
+        params['coding_score_history'] = self.coding_score_history[-10:]
+
+        return CodingAnalysisResult(
+            coding_type=str(selected.get('coding_type', 'Raw')),
+            confidence=float(selected.get('score', 0.0)),
+            parameters=params,
+            decoded_bits=np.asarray(selected.get('decoded_bits')) if selected.get('decoded_bits') is not None else bits,
+            error_correction_info=None,
+        )
+
+    def _rank_hypotheses(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge duplicate hypothesis types and rank by max score."""
+        merged: Dict[str, Dict[str, Any]] = {}
+        for item in candidates:
+            mod_type = str(item.get('type', 'Unknown'))
+            score = float(item.get('score', 0.0))
+            source = item.get('source', 'unknown')
+            if mod_type not in merged or score > merged[mod_type]['score']:
+                merged[mod_type] = {'type': mod_type, 'score': score, 'source': source}
+
+        ranked = sorted(merged.values(), key=lambda x: float(x.get('score', 0.0)), reverse=True)
+        return ranked
+
+    def _push_score_history(self, history: List[Dict[str, Any]], entry: Dict[str, Any], max_items: int = 100) -> None:
+        history.append(entry)
+        if len(history) > max_items:
+            del history[:-max_items]
+
+    def _score_coding_hypothesis(self, decode_result: Dict[str, Any]) -> float:
+        """Score coding hypothesis from decoder output quality hints."""
+        if not decode_result:
+            return 0.0
+
+        success_bonus = 0.2 if decode_result.get('success') else 0.0
+        error_rate = decode_result.get('error_rate')
+        error_penalty = 0.0
+        if error_rate is not None:
+            try:
+                error_penalty = min(0.8, max(0.0, float(error_rate)))
+            except Exception:
+                error_penalty = 0.0
+
+        corrected = decode_result.get('corrected_errors')
+        corrected_bonus = 0.0
+        if corrected is not None:
+            try:
+                corrected_bonus = min(0.3, np.log10(1 + max(0, int(corrected))) / 5)
+            except Exception:
+                corrected_bonus = 0.0
+
+        base = 0.5 + success_bonus + corrected_bonus - error_penalty
+        return float(max(0.0, min(1.0, base)))
     
     def _calculate_signal_quality_metrics(self, iq_data: np.ndarray, 
                                         demod_result: DemodulationResult) -> Dict[str, float]:

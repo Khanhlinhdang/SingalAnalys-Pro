@@ -9,3 +9,8 @@ sdrconnect
 sdr
 scikit-dsp-comm
 scikit-commpy
+pyfftw
+psutil
+PyOpenGL
+pyrtlsdr
+pyhackrf

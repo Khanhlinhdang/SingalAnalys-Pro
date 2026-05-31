@@ -1,22 +1,102 @@
 {
-  "timestamp": 1780214456.2431104,
-  "overall_result": true,
-  "total_duration": 2.790458917617798,
+  "timestamp": 1780241542.626682,
+  "overall_result": false,
+  "total_duration": 12.708730936050415,
   "summary": {
-    "total_tests": 11,
-    "total_failures": 0,
-    "total_errors": 0,
-    "total_skipped": 11,
-    "passed_modules": 1,
-    "total_modules": 1
+    "total_tests": 188,
+    "total_failures": 1,
+    "total_errors": 2,
+    "total_skipped": 0,
+    "passed_modules": 9,
+    "total_modules": 11
   },
   "modules": {
-    "integration": {
+    "imports": {
       "tests_run": 11,
       "failures": 0,
+      "errors": 1,
+      "skipped": 0,
+      "duration": 2.2626068592071533,
+      "success": false
+    },
+    "contract_schema": {
+      "tests_run": 4,
+      "failures": 0,
       "errors": 0,
-      "skipped": 11,
-      "duration": 0.0004343986511230469,
+      "skipped": 0,
+      "duration": 3.2426719665527344,
+      "success": true
+    },
+    "output_adapters": {
+      "tests_run": 7,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.0330350399017334,
+      "success": true
+    },
+    "protocol_plugins": {
+      "tests_run": 10,
+      "failures": 1,
+      "errors": 1,
+      "skipped": 0,
+      "duration": 0.9098167419433594,
+      "success": false
+    },
+    "meteor_decode_chain": {
+      "tests_run": 6,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.18107271194458008,
+      "success": true
+    },
+    "decode_depth_stages": {
+      "tests_run": 3,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.003738880157470703,
+      "success": true
+    },
+    "decode_hypothesis_hooks": {
+      "tests_run": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 1.9396181106567383,
+      "success": true
+    },
+    "dsp_filters": {
+      "tests_run": 27,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.051393985748291016,
+      "success": true
+    },
+    "dsp_modulation": {
+      "tests_run": 36,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.03949093818664551,
+      "success": true
+    },
+    "dsp_analysis": {
+      "tests_run": 33,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.08361625671386719,
+      "success": true
+    },
+    "dsp_utils": {
+      "tests_run": 47,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "duration": 0.021283388137817383,
       "success": true
     }
   },
@@ -24,6 +104,6 @@
     "coverage": false,
     "performance": false,
     "debug": false,
-    "ci_mode": true
+    "ci_mode": false
   }
 }

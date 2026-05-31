@@ -101,6 +101,9 @@ class WaterfallWidget(QWidget):
         # Configure axes
         plot.invertY(True)  # Time axis goes from top to bottom
         plot.setAspectLocked(False)
+        # Waterfall X-axis is driven externally by spectrum; disable direct interaction.
+        plot.getViewBox().setMouseEnabled(x=False, y=False)
+        plot.setMenuEnabled(False)
         
         # Add colorbar
         self.colorbar = pg.ColorBarItem(
@@ -243,10 +246,7 @@ class WaterfallWidget(QWidget):
                 )
             
             # Update plot ranges
-            plot = self.plot_widget.getPlotItem()
-            if len(self.frequency_axis) > 0:
-                plot.setXRange(self.frequency_axis[0], self.frequency_axis[-1])
-            # plot.setYRange(0, len(self.waterfall_data))
+            # X range is synchronized from spectrum viewbox.
             
         except Exception as e:
             print(f"Error updating waterfall image: {e}")
@@ -327,3 +327,16 @@ class WaterfallWidget(QWidget):
         except Exception as e:
             print(f"Error saving waterfall image: {e}")
             return False
+
+    def bind_x_axis_to_spectrum(self, spectrum_view_box):
+        """Bind waterfall X-axis to the spectrum viewbox."""
+        try:
+            self.plot_widget.getPlotItem().getViewBox().setXLink(spectrum_view_box)
+        except Exception as e:
+            print(f"Error binding waterfall X-axis: {e}")
+
+    def set_frequency_view_range(self, x_min: float, x_max: float):
+        """Apply X-axis range from spectrum widget."""
+        if not (np.isfinite(x_min) and np.isfinite(x_max) and x_min < x_max):
+            return
+        self.plot_widget.getPlotItem().setXRange(float(x_min), float(x_max), padding=0)

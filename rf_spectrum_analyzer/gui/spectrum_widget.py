@@ -18,6 +18,7 @@ class SpectrumWidget(QWidget):
     frequency_clicked = Signal(float)  # Emitted when user clicks on frequency
     frequency_range_selected = Signal(float, float)  # Emitted when user selects frequency range
     signal_analysis_requested = Signal(dict)  # Emitted when user requests signal analysis
+    x_range_changed = Signal(float, float)  # Emitted when spectrum X view range changes
     
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -46,6 +47,10 @@ class SpectrumWidget(QWidget):
         # Peak hold
         self.peak_hold_enabled = False
         self.peak_hold_data = np.array([])
+
+        # Viewbox bounds for safer pan/zoom interaction.
+        self._freq_min = None
+        self._freq_max = None
         
         self.setup_ui()
         self.setup_plot()
@@ -117,6 +122,11 @@ class SpectrumWidget(QWidget):
         plot.setLabel('left', 'Power', units='dB')
         plot.setLabel('bottom', 'Frequency', units='Hz')
         plot.setTitle('RF Spectrum')
+
+        # Make interaction easier: left-drag pans in X, keep Y stable.
+        view_box = plot.getViewBox()
+        view_box.setMouseMode(pg.ViewBox.PanMode)
+        view_box.setMouseEnabled(x=True, y=False)
         
         # Set axis ranges
         # Validate initial Y range values
@@ -186,10 +196,18 @@ class SpectrumWidget(QWidget):
         # Connect mouse events
         self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+        self.plot_widget.getPlotItem().getViewBox().sigXRangeChanged.connect(self._on_x_range_changed)
         
         # Set initial visibility
         # self.crosshair_v.setVisible(False)
         # self.crosshair_h.setVisible(False)
+
+    def _on_x_range_changed(self, _view_box, x_range):
+        """Forward spectrum X axis view changes to listeners."""
+        try:
+            self.x_range_changed.emit(float(x_range[0]), float(x_range[1]))
+        except Exception:
+            pass
     
     def update_data(self, spectrum_data: np.ndarray):
         """Update spectrum display with new data."""
@@ -237,10 +255,37 @@ class SpectrumWidget(QWidget):
         # Create frequency array
         freqs = np.linspace(-sample_rate/2, sample_rate/2, num_points)
         self.frequency_axis = freqs + center_freq
+
+        self._freq_min = float(self.frequency_axis[0])
+        self._freq_max = float(self.frequency_axis[-1])
+        span = max(self._freq_max - self._freq_min, 1.0)
+        min_x_span = max(span / 200.0, 1.0)
         
         # Update plot X axis
         plot = self.plot_widget.getPlotItem()
-        plot.setXRange(self.frequency_axis[0], self.frequency_axis[-1])
+        view_box = plot.getViewBox()
+        view_box.setLimits(
+            xMin=self._freq_min,
+            xMax=self._freq_max,
+            minXRange=min_x_span,
+            maxXRange=span,
+        )
+
+        current_x = view_box.viewRange()[0]
+        cur_min = float(current_x[0])
+        cur_max = float(current_x[1])
+        cur_span = max(cur_max - cur_min, min_x_span)
+
+        # Keep current zoom when possible, but clamp range to valid RF span.
+        if cur_min < self._freq_min or cur_max > self._freq_max:
+            clamped_min = min(max(cur_min, self._freq_min), self._freq_max - cur_span)
+            clamped_max = clamped_min + cur_span
+            if clamped_max > self._freq_max:
+                clamped_max = self._freq_max
+                clamped_min = max(self._freq_min, clamped_max - cur_span)
+            plot.setXRange(clamped_min, clamped_max, padding=0)
+        elif not np.isfinite(cur_min) or not np.isfinite(cur_max) or cur_max <= cur_min:
+            plot.setXRange(self._freq_min, self._freq_max, padding=0)
     
     def _detect_and_show_peaks(self, spectrum_data=None):
         """Detect peaks in spectrum and display them."""
@@ -533,6 +578,19 @@ class SpectrumWidget(QWidget):
     
     def set_frequency_range(self, f1: float, f2: float):
         """Set frequency range region."""
+        if self._freq_min is not None and self._freq_max is not None:
+            lo = float(self._freq_min)
+            hi = float(self._freq_max)
+            f1 = min(max(float(f1), lo), hi)
+            f2 = min(max(float(f2), lo), hi)
+
+        if f1 > f2:
+            f1, f2 = f2, f1
+
+        # Avoid zero-width region, keep at least one FFT-bin-ish span.
+        if abs(f2 - f1) < 1.0:
+            f2 = f1 + 1.0
+
         self.f1_frequency = f1
         self.f2_frequency = f2
         
@@ -551,6 +609,22 @@ class SpectrumWidget(QWidget):
     def _on_frequency_region_changed(self):
         """Handle frequency region change."""
         f1, f2 = self.freq_range_region.getRegion()
+
+        if self._freq_min is not None and self._freq_max is not None:
+            lo = float(self._freq_min)
+            hi = float(self._freq_max)
+            clamped_f1 = min(max(float(f1), lo), hi)
+            clamped_f2 = min(max(float(f2), lo), hi)
+            if clamped_f1 > clamped_f2:
+                clamped_f1, clamped_f2 = clamped_f2, clamped_f1
+            if abs(clamped_f2 - clamped_f1) < 1.0:
+                clamped_f2 = min(hi, clamped_f1 + 1.0)
+
+            if abs(clamped_f1 - f1) > 1e-6 or abs(clamped_f2 - f2) > 1e-6:
+                self.freq_range_region.blockSignals(True)
+                self.freq_range_region.setRegion([clamped_f1, clamped_f2])
+                self.freq_range_region.blockSignals(False)
+                f1, f2 = clamped_f1, clamped_f2
         
         self.f1_frequency = f1
         self.f2_frequency = f2

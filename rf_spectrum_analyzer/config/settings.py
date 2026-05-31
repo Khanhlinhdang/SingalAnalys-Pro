@@ -7,8 +7,8 @@ import os
 import yaml
 import json
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, TYPE_CHECKING
+from dataclasses import dataclass, asdict, field
+from typing import Dict, Any, Optional, TYPE_CHECKING, List
 import logging
 
 if TYPE_CHECKING:
@@ -177,6 +177,10 @@ class GUISettings:
     waterfall_visible: bool = True
     constellation_visible: bool = False
 
+    # Dock layout persistence
+    dock_layout_state_b64: str = ""
+    window_preset: str = "monitoring"
+
 
 @dataclass
 class ProcessingSettings:
@@ -218,6 +222,22 @@ class NetworkSettings:
     streaming_port: int = 5556
 
 
+@dataclass
+class FileSourceSettings:
+    """Last-used advanced parameters for file source analysis."""
+    sample_rate_hz: float = 0.0
+    freq_offset_hz: float = 0.0
+    start_sec: float = 0.0
+    duration_sec: float = 0.0
+
+
+@dataclass
+class ROISettings:
+    """Persisted ROI presets used for repeatable analysis workflows."""
+    presets: List[Dict[str, Any]] = field(default_factory=list)
+    last_selected_preset: str = ""
+
+
 class Settings:
     """Main settings class that manages all configuration."""
     
@@ -229,6 +249,8 @@ class Settings:
         self.processing = ProcessingSettings()
         self.network = NetworkSettings()
         self.detection = DetectionSettings()
+        self.file_source = FileSourceSettings()
+        self.roi = ROISettings()
         
         # Configuration file paths
         self.config_dir = Path.home() / ".rf_spectrum_analyzer"
@@ -249,7 +271,9 @@ class Settings:
             "gui": asdict(self.gui),
             "processing": asdict(self.processing),
             "network": asdict(self.network),
-            "detection": asdict(self.detection)
+            "detection": asdict(self.detection),
+            "file_source": asdict(self.file_source),
+            "roi": asdict(self.roi),
         }
     
     def from_dict(self, data: Dict[str, Any]) -> None:
@@ -266,6 +290,10 @@ class Settings:
             self.network = NetworkSettings(**data["network"])
         if "detection" in data:
             self.detection = DetectionSettings(**data["detection"])
+        if "file_source" in data:
+            self.file_source = FileSourceSettings(**data["file_source"])
+        if "roi" in data:
+            self.roi = ROISettings(**data["roi"])
         if "network" in data:
             self.network = NetworkSettings(**data["network"])
     

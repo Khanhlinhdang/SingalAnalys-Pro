@@ -138,7 +138,6 @@ class ControlsWidget(QWidget):
         
         self.device_combo = QComboBox()
         self.device_combo.addItems(['rtlsdr', 'hackrf', 'pluto', 'usrp', 'USRP N2xx/X3xx Series', 'soapy', 'spyserver', 'file'])
-        self.device_combo.currentTextChanged.connect(self.device_changed.emit)
         device_layout.addRow("Device Type:", self.device_combo)
         
         # Status indicators section
@@ -1095,6 +1094,21 @@ class ControlsWidget(QWidget):
     
     def _on_device_type_changed(self, device_type: str):
         """Handle device type change to show/hide specific controls."""
+        # "file" is not a live SDR — emit signal (app will open file dialog),
+        # then restore combo to previous live device so it doesn't stay on "file"
+        if device_type.lower() == "file":
+            # Emit so app can intercept and open file dialog
+            self.device_changed.emit(device_type)
+            # Restore combo to the last real device type (settings value)
+            prev = getattr(self, '_last_live_device', 'spyserver')
+            self.device_combo.blockSignals(True)
+            self.device_combo.setCurrentText(prev)
+            self.device_combo.blockSignals(False)
+            return
+
+        # Remember last live device
+        self._last_live_device = device_type
+
         # Show/hide SpyServer controls
         is_spyserver = device_type == "spyserver"
         self.spyserver_group.setVisible(is_spyserver)

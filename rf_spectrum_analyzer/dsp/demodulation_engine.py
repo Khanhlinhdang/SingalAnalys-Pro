@@ -177,6 +177,75 @@ class BaseDemodulator:
         
         return signal_data
 
+    def _estimate_cfo_hz(self, signal_data: np.ndarray) -> float:
+        """Estimate carrier frequency offset from phase progression."""
+        try:
+            if signal_data is None or len(signal_data) < 2:
+                return 0.0
+            phase = np.unwrap(np.angle(signal_data))
+            freq = np.diff(phase) * self.sample_rate / (2 * np.pi)
+            if len(freq) == 0:
+                return 0.0
+            return float(np.median(freq))
+        except Exception as e:
+            logger.warning(f"CFO estimation error: {e}")
+            return 0.0
+
+    def _build_sync_quality(
+        self,
+        signal_data: np.ndarray,
+        symbols: np.ndarray,
+        samples_per_symbol: int,
+        evm: Optional[float] = None,
+        ber: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Build stable sync/carrier lock telemetry for digital demodulators."""
+        try:
+            residual_symbol_fraction = 0.0
+            if samples_per_symbol > 0 and signal_data is not None:
+                residual_symbol_fraction = float((len(signal_data) % samples_per_symbol) / samples_per_symbol)
+
+            cfo_hz = self._estimate_cfo_hz(signal_data)
+            carrier_lock = bool(abs(cfo_hz) <= max(250.0, self.sample_rate * 0.0025))
+            timing_lock = bool(residual_symbol_fraction <= 0.5 and symbols is not None and len(symbols) > 0)
+
+            evm_value = float(evm) if evm is not None else 50.0
+            ber_value = float(ber) if ber is not None else 0.5
+            lock_confidence = 1.0
+            lock_confidence -= min(0.45, abs(cfo_hz) / max(self.sample_rate, 1.0))
+            lock_confidence -= min(0.35, evm_value / 200.0)
+            lock_confidence -= min(0.20, ber_value)
+            if timing_lock:
+                lock_confidence += 0.1
+            lock_confidence = float(max(0.0, min(1.0, lock_confidence)))
+
+            snr_db = None
+            if evm_value > 0:
+                snr_db = float(20.0 * np.log10(100.0 / max(evm_value, 1e-6)))
+
+            return {
+                'cfo_hz': cfo_hz,
+                'timing_error_rms': residual_symbol_fraction,
+                'carrier_lock': carrier_lock,
+                'timing_lock': timing_lock,
+                'lock_confidence': lock_confidence,
+                'snr_db': snr_db,
+                'evm': evm_value,
+                'ber_estimate': ber_value,
+            }
+        except Exception as e:
+            logger.warning(f"Sync quality build error: {e}")
+            return {
+                'cfo_hz': 0.0,
+                'timing_error_rms': 1.0,
+                'carrier_lock': False,
+                'timing_lock': False,
+                'lock_confidence': 0.0,
+                'snr_db': None,
+                'evm': float(evm) if evm is not None else 50.0,
+                'ber_estimate': float(ber) if ber is not None else 0.5,
+            }
+
 
 class AMDemodulator(BaseDemodulator):
     """Amplitude Modulation demodulator."""
@@ -328,6 +397,7 @@ class PSKDemodulator(BaseDemodulator):
             # Calculate metrics
             evm = self._calculate_evm_advanced(phase_recovered, symbols)
             ber = self._estimate_ber_advanced(phase_recovered, symbols)
+            sync_quality = self._build_sync_quality(signal_norm, phase_recovered, samples_per_symbol, evm, ber)
             
             return {
                 "demodulated_data": bits,
@@ -337,7 +407,14 @@ class PSKDemodulator(BaseDemodulator):
                 "data_type": "digital",
                 "evm": evm,
                 "ber_estimate": ber,
-                "snr_db": -20 * np.log10(evm) if evm > 0 else float('inf')
+                "snr_db": sync_quality['snr_db'],
+                "snr": sync_quality['snr_db'],
+                "cfo_hz": sync_quality['cfo_hz'],
+                "timing_error_rms": sync_quality['timing_error_rms'],
+                "carrier_lock": sync_quality['carrier_lock'],
+                "timing_lock": sync_quality['timing_lock'],
+                "lock_confidence": sync_quality['lock_confidence'],
+                "quality_metrics": sync_quality,
             }
             
         except Exception as e:
@@ -372,6 +449,7 @@ class PSKDemodulator(BaseDemodulator):
             # Calculate EVM and BER
             evm = np.sqrt(np.mean(np.abs(phase_recovered - symbols)**2))
             ber = np.mean(bits != (np.real(phase_recovered) > 0))
+            sync_quality = self._build_sync_quality(signal_norm, phase_recovered, samples_per_symbol, evm, ber)
             
             return {
                 "demodulated_data": bits,
@@ -381,7 +459,15 @@ class PSKDemodulator(BaseDemodulator):
                 "data_type": "digital",
                 "evm": evm,
                 "ber_estimate": ber,
-                "timing_error": timing_error
+                "timing_error": timing_error,
+                "snr_db": sync_quality['snr_db'],
+                "snr": sync_quality['snr_db'],
+                "cfo_hz": sync_quality['cfo_hz'],
+                "timing_error_rms": sync_quality['timing_error_rms'],
+                "carrier_lock": sync_quality['carrier_lock'],
+                "timing_lock": sync_quality['timing_lock'],
+                "lock_confidence": sync_quality['lock_confidence'],
+                "quality_metrics": sync_quality,
             }
             
         except Exception as e:
@@ -410,6 +496,7 @@ class PSKDemodulator(BaseDemodulator):
             
             # Decision: 0 for negative real part, 1 for positive
             bits = (np.real(symbols) > 0).astype(int)
+            sync_quality = self._build_sync_quality(signal_norm, symbols, samples_per_symbol, self._calculate_evm(symbols, bits), self._estimate_ber(symbols, bits))
             
             return {
                 "demodulated_data": bits,
@@ -418,7 +505,15 @@ class PSKDemodulator(BaseDemodulator):
                 "data_type": "digital",
                 "constellation": symbols,
                 "evm": self._calculate_evm(symbols, bits),
-                "ber_estimate": self._estimate_ber(symbols, bits)
+                "ber_estimate": self._estimate_ber(symbols, bits),
+                "snr_db": sync_quality['snr_db'],
+                "snr": sync_quality['snr_db'],
+                "cfo_hz": sync_quality['cfo_hz'],
+                "timing_error_rms": sync_quality['timing_error_rms'],
+                "carrier_lock": sync_quality['carrier_lock'],
+                "timing_lock": sync_quality['timing_lock'],
+                "lock_confidence": sync_quality['lock_confidence'],
+                "quality_metrics": sync_quality,
             }
             
         except Exception as e:
@@ -1066,6 +1161,10 @@ class PSK8Demodulator(BaseDemodulator):
                 # Convert to 3 bits
                 bit_triplet = format(closest_index, '03b')
                 bits.extend([int(b) for b in bit_triplet])
+
+            evm = self._calculate_psk8_evm(symbols)
+            ber = self._estimate_ber(symbols)
+            sync_quality = self._build_sync_quality(signal_norm, symbols, samples_per_symbol, evm, ber)
             
             return {
                 "demodulated_data": np.array(bits),
@@ -1073,8 +1172,16 @@ class PSK8Demodulator(BaseDemodulator):
                 "sample_rate": self.symbol_rate * 3,  # 3 bits per symbol
                 "data_type": "digital",
                 "constellation": symbols,
-                "evm": self._calculate_psk8_evm(symbols),
-                "ber_estimate": self._estimate_ber(symbols)
+                "evm": evm,
+                "ber_estimate": ber,
+                "snr_db": sync_quality['snr_db'],
+                "snr": sync_quality['snr_db'],
+                "cfo_hz": sync_quality['cfo_hz'],
+                "timing_error_rms": sync_quality['timing_error_rms'],
+                "carrier_lock": sync_quality['carrier_lock'],
+                "timing_lock": sync_quality['timing_lock'],
+                "lock_confidence": sync_quality['lock_confidence'],
+                "quality_metrics": sync_quality,
             }
             
         except Exception as e:
@@ -1100,6 +1207,31 @@ class PSK8Demodulator(BaseDemodulator):
         except Exception as e:
             logger.warning(f"8-PSK EVM calculation error: {e}")
         
+        return 0.0
+
+    def _estimate_ber(self, symbols: np.ndarray) -> float:
+        """Estimate BER for 8-PSK using nearest-constellation decisions."""
+        try:
+            if symbols is None or len(symbols) == 0:
+                return 0.0
+
+            ideal_points = np.exp(1j * 2 * np.pi * np.arange(8) / 8)
+            bit_errors = 0
+            total_bits = 0
+
+            for symbol in symbols:
+                distances = np.abs(symbol - ideal_points)
+                closest_index = int(np.argmin(distances))
+                error_distance = float(np.abs(symbol - ideal_points[closest_index]))
+                if error_distance > 0.5:
+                    bit_errors += 1
+                total_bits += 3
+
+            if total_bits > 0:
+                return float(bit_errors / total_bits)
+        except Exception as e:
+            logger.warning(f"8-PSK BER estimation error: {e}")
+
         return 0.0
 
 

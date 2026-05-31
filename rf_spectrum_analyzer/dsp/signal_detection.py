@@ -82,6 +82,12 @@ class SignalDetectionEngine:
         # Detection history for adaptive algorithms
         self.detection_history = []
         self.noise_history = []
+
+        # Runtime compatibility state for sdr.EnergyDetector API variants.
+        self._sdr_energy_available = bool(SDR_AVAILABLE and hasattr(sdr, 'EnergyDetector'))
+        self._sdr_threshold_n_key = 'n_nc'
+        self._sdr_pd_n_key = 'n_nc'
+        self._sdr_energy_warning_emitted = False
         
         logger.info(f"Signal Detection Engine initialized with {sample_rate} Hz sample rate")
         logger.info(f"SDR library available: {SDR_AVAILABLE}")
@@ -173,15 +179,10 @@ class SignalDetectionEngine:
             test_statistic = np.sum(np.abs(test_signal) ** 2)
             
             # Use sdr._detection for theoretical calculations
-            if SDR_AVAILABLE and hasattr(sdr, 'EnergyDetector'):
+            if self._sdr_energy_available:
                 try:
                     # Calculate detection threshold
-                    threshold = sdr.EnergyDetector.threshold(
-                        N_nc=N_samples,
-                        p_fa=p_fa,
-                        sigma2=self.noise_variance,
-                        complex=True
-                    )
+                    threshold = self._compute_sdr_energy_threshold(N_samples, p_fa)
                     
                     # Calculate SNR estimate
                     signal_power = test_statistic / N_samples
@@ -189,19 +190,18 @@ class SignalDetectionEngine:
                     snr_db = 10 * np.log10(max(snr_linear, 1e-10))
                     
                     # Calculate probability of detection
-                    p_d = sdr.EnergyDetector.p_d(
-                        snr=snr_db,
-                        N_nc=N_samples,
-                        p_fa=p_fa,
-                        complex=True
-                    )
+                    p_d = self._compute_sdr_energy_pd(snr_db, N_samples, p_fa)
                     
                     # Make detection decision
                     signal_detected = test_statistic > threshold
                     confidence = float(p_d) if signal_detected else (1.0 - float(p_fa))
                     
                 except Exception as e:
-                    logger.warning(f"SDR energy detection failed: {e}, using fallback")
+                    # Avoid repeating expensive exceptions and warning spam each frame.
+                    self._sdr_energy_available = False
+                    if not self._sdr_energy_warning_emitted:
+                        logger.warning(f"SDR energy detection failed: {e}, using fallback")
+                        self._sdr_energy_warning_emitted = True
                     threshold, signal_detected, confidence, snr_db, p_d = self._fallback_energy_detection(
                         test_statistic, N_samples, p_fa
                     )
@@ -242,6 +242,64 @@ class SignalDetectionEngine:
                 p_d=0.0,
                 noise_variance=self.noise_variance
             )
+
+    def _compute_sdr_energy_threshold(self, n_samples: int, p_fa: float) -> float:
+        """Compute threshold with compatibility across sdr API keyword variants."""
+        base_kwargs = {
+            'p_fa': p_fa,
+            'sigma2': self.noise_variance,
+            'complex': True,
+        }
+
+        candidate_keys = [self._sdr_threshold_n_key, 'n_nc', 'N', 'N_nc']
+        tried = set()
+        last_error = None
+        for key in candidate_keys:
+            if key in tried:
+                continue
+            tried.add(key)
+            kwargs = dict(base_kwargs)
+            kwargs[key] = int(n_samples)
+            try:
+                threshold = sdr.EnergyDetector.threshold(**kwargs)
+                self._sdr_threshold_n_key = key
+                return float(threshold)
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Unable to compute SDR energy threshold")
+
+    def _compute_sdr_energy_pd(self, snr_db: float, n_samples: int, p_fa: float) -> float:
+        """Compute P_D with compatibility across sdr API keyword variants."""
+        base_kwargs = {
+            'snr': snr_db,
+            'p_fa': p_fa,
+            'complex': True,
+        }
+
+        candidate_keys = [self._sdr_pd_n_key, 'n_nc', 'N', 'N_nc']
+        tried = set()
+        last_error = None
+        for key in candidate_keys:
+            if key in tried:
+                continue
+            tried.add(key)
+            kwargs = dict(base_kwargs)
+            kwargs[key] = int(n_samples)
+            try:
+                p_d = sdr.EnergyDetector.p_d(**kwargs)
+                self._sdr_pd_n_key = key
+                return float(p_d)
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Unable to compute SDR energy detection probability")
     
     def _fallback_energy_detection(self, test_statistic: float, N_samples: int, 
                                   p_fa: float) -> Tuple[float, bool, float, float, float]:

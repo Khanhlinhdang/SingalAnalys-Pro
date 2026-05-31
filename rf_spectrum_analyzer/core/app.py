@@ -5,10 +5,18 @@ Coordinates GUI, SDR backend, and signal processing components.
 
 import sys
 import logging
+import time
 import numpy as np
 from collections import deque
 from threading import Lock
+from pathlib import Path
 from typing import Optional, Dict, Any, Deque
+from datetime import datetime
+from uuid import uuid4
+try:
+    import scipy.signal as sp_signal
+except Exception:
+    sp_signal = None
 from PySide6.QtWidgets import QMainWindow, QApplication
 from PySide6.QtCore import QTimer, QThread, Signal, QObject
 from PySide6.QtGui import QCloseEvent
@@ -19,6 +27,7 @@ from rf_spectrum_analyzer.core.signal_processor import SignalProcessor
 from rf_spectrum_analyzer.dsp.signal_analysis import SignalAnalyzer
 from rf_spectrum_analyzer.config.settings import Settings
 from rf_spectrum_analyzer.utils.logger import get_logger
+from rf_spectrum_analyzer.utils.file_io import DataExporter, DataImporter
 
 logger = get_logger(__name__)
 
@@ -93,7 +102,6 @@ class DataAcquisitionThread(QThread):
 
 class ProcessingThread(QThread):
     """Background DSP worker with bounded latest-wins queue."""
-
     processing_result = Signal(dict)
     error_occurred = Signal(str)
 
@@ -170,18 +178,126 @@ class ProcessingThread(QThread):
         return self.wait(wait_timeout_ms)
 
 
+class FileAnalysisWorker(QThread):
+    """Worker thread that runs the full signal analysis pipeline on a file."""
+
+    analysis_done = Signal(dict)
+    error_occurred = Signal(str)
+
+    def __init__(
+        self,
+        data_importer,
+        signal_analyzer_class,
+        settings: Settings,
+        filename: str,
+        center_freq: float,
+        bandwidth: float,
+        advanced_params: Optional[Dict[str, float]] = None,
+    ):
+        super().__init__()
+        self._data_importer = data_importer
+        self._signal_analyzer_class = signal_analyzer_class
+        self._settings = settings
+        self._filename = filename
+        self._center_freq = center_freq
+        self._bandwidth = bandwidth
+        self._advanced_params = advanced_params or {}
+
+    def _apply_advanced(
+        self,
+        iq_data: np.ndarray,
+        sample_rate: float,
+    ) -> (np.ndarray, float):
+        advanced = self._advanced_params or {}
+
+        sample_rate_override = float(advanced.get('sample_rate_hz', 0.0) or 0.0)
+        if sample_rate_override > 1.0:
+            sample_rate = sample_rate_override
+
+        iq = np.asarray(iq_data, dtype=np.complex64)
+
+        start_sec = float(advanced.get('start_sec', 0.0) or 0.0)
+        duration_sec = float(advanced.get('duration_sec', 0.0) or 0.0)
+        if start_sec > 0.0 or duration_sec > 0.0:
+            start_idx = int(max(start_sec, 0.0) * sample_rate)
+            if duration_sec > 0.0:
+                end_idx = start_idx + int(duration_sec * sample_rate)
+            else:
+                end_idx = len(iq)
+            start_idx = min(max(start_idx, 0), len(iq))
+            end_idx = min(max(end_idx, start_idx), len(iq))
+            iq = iq[start_idx:end_idx]
+
+        freq_offset_hz = float(advanced.get('freq_offset_hz', 0.0) or 0.0)
+        if abs(freq_offset_hz) > 0.0 and len(iq) > 0 and sample_rate > 0.0:
+            n = np.arange(len(iq), dtype=np.float64)
+            rot = np.exp(-1j * 2.0 * np.pi * freq_offset_hz * (n / sample_rate))
+            iq = (iq * rot).astype(np.complex64, copy=False)
+
+        return iq, sample_rate
+
+    def run(self):
+        try:
+            iq_data, metadata = self._data_importer.import_signal_source(self._filename)
+            if iq_data is None or len(iq_data) == 0:
+                self.error_occurred.emit(f"Failed to import signal source from {self._filename}")
+                return
+
+            sample_rate = float(metadata.get('sample_rate') or self._settings.sdr.sample_rate)
+            iq_prepared, sample_rate = self._apply_advanced(iq_data, sample_rate)
+            if iq_prepared is None or len(iq_prepared) == 0:
+                self.error_occurred.emit("Selected segment is empty after applying advanced file settings")
+                return
+
+            analyzer = self._signal_analyzer_class(sample_rate)
+            result = analyzer.analyze_signal_comprehensive(
+                iq_prepared,
+                self._center_freq,
+                self._bandwidth,
+            )
+
+            payload = result.get('payload', result)
+            payload['source_metadata'] = metadata
+            payload['source_file'] = self._filename
+            payload['source_advanced'] = self._advanced_params
+            self.analysis_done.emit(result)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+
 class AnalysisRequestThread(QThread):
     """One-shot async thread for analysis requests from the spectrum widget."""
 
     completed = Signal(dict)
     error_occurred = Signal(str)
 
-    def __init__(self, sample_rate: float, iq_data: np.ndarray, center_freq: float, bandwidth: float):
+    def __init__(
+        self,
+        sample_rate: float,
+        iq_data: np.ndarray,
+        center_freq: float,
+        bandwidth: float,
+        analysis_context: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__()
         self.sample_rate = sample_rate
         self.iq_data = np.asarray(iq_data, dtype=np.complex64)
         self.center_freq = center_freq
         self.bandwidth = bandwidth
+        self.analysis_context = dict(analysis_context or {})
+
+    def _attach_analysis_context(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach ROI/runtime context into analysis payload for observability."""
+        if not isinstance(result, dict):
+            return result
+
+        payload = result.get('payload')
+        if isinstance(payload, dict):
+            payload['analysis_context'] = dict(self.analysis_context)
+            return result
+
+        result['analysis_context'] = dict(self.analysis_context)
+        return result
 
     def run(self):
         try:
@@ -191,7 +307,7 @@ class AnalysisRequestThread(QThread):
                 self.center_freq,
                 self.bandwidth,
             )
-            self.completed.emit(result)
+            self.completed.emit(self._attach_analysis_context(result))
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 
@@ -203,6 +319,7 @@ class RFSpectrumAnalyzerApp(QObject):
         super().__init__()
         self.settings = settings
         self.logger = get_logger(__name__)
+        self.headless_mode = getattr(settings, 'headless_mode', False)
         
         # Core components
         self.sdr_manager = None
@@ -212,6 +329,19 @@ class RFSpectrumAnalyzerApp(QObject):
         self.acquisition_thread = None
         self.processing_thread = None
         self.analysis_request_thread = None
+        self.data_exporter = DataExporter()
+        self.data_importer = DataImporter()
+        self._file_worker = None
+        self._resume_acquisition_after_file = False
+        self.latest_image_artifact: Optional[Dict[str, Any]] = None
+        self.latest_pcm_artifact: Optional[Dict[str, Any]] = None
+        self.latest_signal_source: Optional[Dict[str, Any]] = None
+        self.analysis_session_records: Deque[Dict[str, Any]] = deque(maxlen=512)
+        self.roi_analysis_queue: Deque[Dict[str, Any]] = deque(maxlen=128)
+        self._last_roi_request_signature: Optional[str] = None
+        self._last_roi_request_mono: float = 0.0
+        self._roi_request_debounce_sec: float = 0.25
+        self._roi_preset_max_count: int = 32
         
         # Data buffers
         self.iq_snapshot_ring: Deque[np.ndarray] = deque(maxlen=64)
@@ -306,7 +436,7 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.processing_thread = None
             
             # Setup demo mode if enabled
-            if self.demo_mode:
+            if self.demo_mode and not self.headless_mode:
                 self.setup_demo_mode()
             
             self.logger.info("Application initialized successfully")
@@ -318,6 +448,11 @@ class RFSpectrumAnalyzerApp(QObject):
     def _try_sdr_connection(self):
         """Try to connect to SDR device, enable demo mode if connection fails."""
         try:
+            if self.headless_mode:
+                self.logger.info("Headless mode enabled - skipping SDR connection")
+                self.demo_mode = False
+                return
+
             device_type = self.settings.sdr.device_type
             self.logger.info(f"Attempting to connect to {device_type} device...")
             
@@ -363,10 +498,34 @@ class RFSpectrumAnalyzerApp(QObject):
                 self.settings.gui.window_width,
                 self.settings.gui.window_height
             )
-            self.main_window.move(
-                self.settings.gui.window_x,
-                self.settings.gui.window_y
+
+            # Validate saved position against all available screens before restoring.
+            # If the saved coordinates land entirely off-screen (e.g. a previously
+            # connected external monitor was disconnected) we center instead.
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import QPoint, QRect
+            saved_x = self.settings.gui.window_x
+            saved_y = self.settings.gui.window_y
+            screens = QApplication.screens()
+            on_screen = any(
+                screen.geometry().contains(QPoint(saved_x + 50, saved_y + 50))
+                for screen in screens
             )
+            if on_screen:
+                self.main_window.move(saved_x, saved_y)
+            else:
+                # Center on the primary screen
+                primary = QApplication.primaryScreen()
+                screen_rect: QRect = primary.availableGeometry()
+                win_w = self.main_window.width()
+                win_h = self.main_window.height()
+                cx = screen_rect.x() + (screen_rect.width() - win_w) // 2
+                cy = screen_rect.y() + (screen_rect.height() - win_h) // 2
+                self.main_window.move(max(screen_rect.x(), cx), max(screen_rect.y(), cy))
+                self.logger.info(
+                    "Saved window position (%d, %d) is off-screen; centering on primary display.",
+                    saved_x, saved_y,
+                )
     
     def connect_signals(self):
         """Connect signals between components."""
@@ -405,6 +564,11 @@ class RFSpectrumAnalyzerApp(QObject):
             # Connect sequential workflow signals
             self.main_window.demodulate_triggered.connect(self.trigger_sequential_demodulation)
             self.main_window.decode_triggered.connect(self.trigger_sequential_decoding)
+            self.main_window.export_image_artifact_requested.connect(self.export_latest_image_artifact)
+            self.main_window.export_pcm_artifact_requested.connect(self.export_latest_pcm_artifact)
+            self.main_window.export_session_report_requested.connect(self.export_session_decode_report)
+            self.main_window.load_session_report_requested.connect(self.load_session_decode_report)
+            self.main_window.process_signal_file_requested.connect(self.process_signal_file)
     
     def setup_timers(self):
         """Setup GUI update timers."""
@@ -862,6 +1026,13 @@ class RFSpectrumAnalyzerApp(QObject):
         """Change SDR device type."""
         try:
             self.logger.info(f"Changing device to: {device_type}")
+
+            # "file" is not a live SDR backend — open file dialog instead
+            if device_type.lower() == "file":
+                if self.main_window and not self.headless_mode:
+                    self.main_window.trigger_open_signal_file()
+                return
+
             self.settings.sdr.device_type = device_type
             
             # Restart acquisition if currently running
@@ -1024,6 +1195,8 @@ class RFSpectrumAnalyzerApp(QObject):
                     self.settings.gui.window_height = self.main_window.height()
                     self.settings.gui.window_x = self.main_window.x()
                     self.settings.gui.window_y = self.main_window.y()
+                    if hasattr(self.main_window, 'save_dock_layout_to_settings'):
+                        self.main_window.save_dock_layout_to_settings()
                 
                 # Save settings to file
                 self.settings.save()
@@ -1188,29 +1361,84 @@ class RFSpectrumAnalyzerApp(QObject):
     
     def handle_signal_analysis_request(self, analysis_request: Dict[str, Any]):
         """Handle signal analysis request from spectrum widget."""
+        request_id = None
         try:
+            queue_entry = self._enqueue_roi_analysis_request(analysis_request)
+            if not queue_entry:
+                self.logger.info("Debounced duplicate ROI analysis request")
+                return
+            request_id = str(queue_entry.get('request_id', ''))
+            self._update_roi_queue_status(request_id, 'running', result_note='ROI request accepted')
+            self._persist_roi_preset_from_request(analysis_request)
+
             self.logger.info(f"Processing signal analysis request for {analysis_request['center_freq']/1e6:.3f} MHz")
             
             # Get IQ data for the specified frequency range
-            iq_data = self._get_iq_data_for_range(
+            range_result = self._get_iq_data_for_range(
                 analysis_request['center_freq'],
-                analysis_request['bandwidth']
+                analysis_request['bandwidth'],
+                analysis_request.get('freq_range'),
+                return_sample_rate=True,
             )
+
+            if isinstance(range_result, tuple) and len(range_result) == 2:
+                iq_data, analysis_sample_rate = range_result
+            else:
+                iq_data = range_result
+                analysis_sample_rate = float(self.settings.sdr.sample_rate)
             
             if iq_data is None or len(iq_data) == 0:
                 self.logger.warning("No IQ data available for analysis")
+                self._update_roi_queue_status(request_id, 'failed', result_note='No IQ data available')
                 return
+
+            source_sample_rate = float(getattr(self.settings.sdr, 'sample_rate', analysis_sample_rate))
+            req_bandwidth = float(analysis_request.get('bandwidth', 0.0) or 0.0)
+            freq_range = analysis_request.get('freq_range')
+            roi_start = float(analysis_request.get('center_freq', 0.0) - req_bandwidth * 0.5)
+            roi_end = float(analysis_request.get('center_freq', 0.0) + req_bandwidth * 0.5)
+            if isinstance(freq_range, (tuple, list)) and len(freq_range) == 2:
+                roi_start = float(freq_range[0])
+                roi_end = float(freq_range[1])
+                if roi_start > roi_end:
+                    roi_start, roi_end = roi_end, roi_start
+
+            decimation_factor = 1.0
+            if np.isfinite(source_sample_rate) and np.isfinite(float(analysis_sample_rate)) and float(analysis_sample_rate) > 0.0:
+                decimation_factor = max(1.0, source_sample_rate / float(analysis_sample_rate))
+
+            stage_status = self._build_stage_status_envelope(
+                is_demo_mode=bool(getattr(self, 'demo_mode', False)),
+                has_iq_data=bool(iq_data is not None and len(iq_data) > 0),
+                roi_bandwidth_hz=max(0.0, roi_end - roi_start),
+                decimation_factor=float(decimation_factor),
+            )
+
+            analysis_context = {
+                'roi_freq_start_hz': roi_start,
+                'roi_freq_end_hz': roi_end,
+                'roi_bandwidth_hz': max(0.0, roi_end - roi_start),
+                'source_sample_rate_hz': source_sample_rate,
+                'analysis_sample_rate_hz': float(analysis_sample_rate),
+                'decimation_factor': float(decimation_factor),
+                'iq_samples_used': int(len(iq_data)),
+                'roi_request_id': request_id,
+                'stage_status': stage_status,
+                'stage_schema_version': '1.0',
+            }
             
             if getattr(self, 'enable_async_analysis_requests', False):
                 if self.analysis_request_thread and self.analysis_request_thread.isRunning():
                     self.logger.warning("Previous analysis request still running; skipping new request")
+                    self._update_roi_queue_status(request_id, 'skipped', result_note='Previous analysis still running')
                     return
 
                 self.analysis_request_thread = AnalysisRequestThread(
-                    self.settings.sdr.sample_rate,
+                    analysis_sample_rate,
                     iq_data,
                     analysis_request['center_freq'],
                     analysis_request['bandwidth'],
+                    analysis_context,
                 )
                 self.analysis_request_thread.completed.connect(self._on_async_analysis_completed)
                 self.analysis_request_thread.error_occurred.connect(
@@ -1222,30 +1450,212 @@ class RFSpectrumAnalyzerApp(QObject):
                     iq_data,
                     analysis_request['center_freq'],
                     analysis_request['bandwidth'],
+                    analysis_sample_rate,
+                    analysis_context,
                 )
                 
         except Exception as e:
             self.logger.error(f"Error handling signal analysis request: {e}")
+            if request_id:
+                self._update_roi_queue_status(request_id, 'failed', result_note=str(e))
 
-    def _analyze_signal_request_sync(self, iq_data: np.ndarray, center_freq: float, bandwidth: float):
-        """Synchronous analysis path used in tests or fallback modes."""
-        if not self.signal_analyzer:
-            self.logger.error("Signal analyzer not initialized")
+    def _build_roi_request_signature(self, analysis_request: Dict[str, Any]) -> str:
+        """Create a compact signature to debounce repeated ROI requests."""
+        if not isinstance(analysis_request, dict):
+            return 'invalid'
+
+        center = float(analysis_request.get('center_freq', 0.0) or 0.0)
+        bandwidth = float(analysis_request.get('bandwidth', 0.0) or 0.0)
+        freq_range = analysis_request.get('freq_range')
+
+        f1 = center - bandwidth * 0.5
+        f2 = center + bandwidth * 0.5
+        if isinstance(freq_range, (tuple, list)) and len(freq_range) == 2:
+            f1 = float(freq_range[0])
+            f2 = float(freq_range[1])
+            if f1 > f2:
+                f1, f2 = f2, f1
+
+        return f"{center:.3f}|{bandwidth:.3f}|{f1:.3f}|{f2:.3f}"
+
+    def _enqueue_roi_analysis_request(self, analysis_request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Track ROI requests and debounce immediate duplicates."""
+        signature = self._build_roi_request_signature(analysis_request)
+        now_mono = time.monotonic()
+        if (
+            signature == self._last_roi_request_signature
+            and (now_mono - self._last_roi_request_mono) < self._roi_request_debounce_sec
+        ):
+            return None
+
+        self._last_roi_request_signature = signature
+        self._last_roi_request_mono = now_mono
+        entry = {
+            'request_id': str(uuid4()),
+            'signature': signature,
+            'status': 'queued',
+            'queued_at_utc': datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
+            'request': dict(analysis_request or {}),
+        }
+        self.roi_analysis_queue.append(entry)
+        self._sync_roi_queue_panel()
+        return entry
+
+    def _sync_roi_queue_panel(self):
+        """Push latest ROI queue snapshot to main-window ROI panel if available."""
+        try:
+            if self.main_window and hasattr(self.main_window, 'update_roi_queue_panel'):
+                self.main_window.update_roi_queue_panel(list(self.roi_analysis_queue))
+        except Exception as exc:
+            self.logger.debug(f"ROI panel sync skipped: {exc}")
+
+    def _update_roi_queue_status(
+        self,
+        request_id: Optional[str],
+        status: str,
+        result_note: str = '',
+        modulation: Optional[str] = None,
+        snr_db: Optional[float] = None,
+    ):
+        """Update tracked ROI request state and mirror it to GUI panel."""
+        if not request_id:
             return
 
-        analysis_results = self.signal_analyzer.analyze_signal_comprehensive(
+        for entry in reversed(self.roi_analysis_queue):
+            if str(entry.get('request_id', '')) != str(request_id):
+                continue
+            entry['status'] = str(status or 'unknown')
+            entry['updated_at_utc'] = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
+            if result_note:
+                entry['result_note'] = str(result_note)
+            if modulation:
+                entry['modulation'] = str(modulation)
+            if snr_db is not None and np.isfinite(float(snr_db)):
+                entry['snr_db'] = float(snr_db)
+            break
+
+        self._sync_roi_queue_panel()
+
+    def _persist_roi_preset_from_request(self, analysis_request: Dict[str, Any]):
+        """Persist ROI presets in settings when a user-triggered analysis is requested."""
+        try:
+            if not hasattr(self.settings, 'roi'):
+                return
+
+            center = float(analysis_request.get('center_freq', 0.0) or 0.0)
+            bandwidth = float(analysis_request.get('bandwidth', 0.0) or 0.0)
+            freq_range = analysis_request.get('freq_range')
+
+            f1 = center - max(bandwidth, 1.0) * 0.5
+            f2 = center + max(bandwidth, 1.0) * 0.5
+            if isinstance(freq_range, (tuple, list)) and len(freq_range) == 2:
+                f1 = float(freq_range[0])
+                f2 = float(freq_range[1])
+                if f1 > f2:
+                    f1, f2 = f2, f1
+
+            if not (np.isfinite(f1) and np.isfinite(f2) and f2 > f1):
+                return
+
+            now_utc = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
+            presets = list(getattr(self.settings.roi, 'presets', []) or [])
+
+            matched = None
+            for item in presets:
+                try:
+                    p1 = float(item.get('freq_start_hz', np.nan))
+                    p2 = float(item.get('freq_end_hz', np.nan))
+                except Exception:
+                    continue
+                if np.isfinite(p1) and np.isfinite(p2) and abs(p1 - f1) <= 10.0 and abs(p2 - f2) <= 10.0:
+                    matched = item
+                    break
+
+            if matched is None:
+                next_idx = len(presets) + 1
+                matched = {
+                    'name': f'ROI {next_idx}',
+                    'freq_start_hz': float(f1),
+                    'freq_end_hz': float(f2),
+                    'center_hz': float((f1 + f2) * 0.5),
+                    'bandwidth_hz': float(f2 - f1),
+                    'usage_count': 0,
+                    'last_used_utc': now_utc,
+                    'created_utc': now_utc,
+                }
+                presets.append(matched)
+            else:
+                matched['freq_start_hz'] = float(f1)
+                matched['freq_end_hz'] = float(f2)
+                matched['center_hz'] = float((f1 + f2) * 0.5)
+                matched['bandwidth_hz'] = float(f2 - f1)
+                matched['last_used_utc'] = now_utc
+
+            matched['usage_count'] = int(matched.get('usage_count', 0) or 0) + 1
+            presets = sorted(
+                presets,
+                key=lambda p: (str(p.get('last_used_utc', '')), int(p.get('usage_count', 0) or 0)),
+                reverse=True,
+            )[: self._roi_preset_max_count]
+
+            self.settings.roi.presets = presets
+            self.settings.roi.last_selected_preset = str(matched.get('name', ''))
+            self.settings.save()
+        except Exception as exc:
+            self.logger.debug(f"ROI preset persistence skipped: {exc}")
+
+    def _analyze_signal_request_sync(
+        self,
+        iq_data: np.ndarray,
+        center_freq: float,
+        bandwidth: float,
+        analysis_sample_rate: Optional[float] = None,
+        analysis_context: Optional[Dict[str, Any]] = None,
+    ):
+        """Synchronous analysis path used in tests or fallback modes."""
+        request_id = None
+        if isinstance(analysis_context, dict):
+            request_id = analysis_context.get('roi_request_id')
+
+        if not self.signal_analyzer and analysis_sample_rate is None:
+            self.logger.error("Signal analyzer not initialized")
+            self._update_roi_queue_status(request_id, 'failed', result_note='Signal analyzer not initialized')
+            return
+
+        requested_sr = float(analysis_sample_rate or self.settings.sdr.sample_rate)
+        analyzer = self.signal_analyzer
+        analyzer_sr = float(getattr(analyzer, 'sample_rate', requested_sr)) if analyzer else requested_sr
+        if analyzer is None or abs(analyzer_sr - requested_sr) > 1e-3:
+            analyzer = SignalAnalyzer(requested_sr)
+
+        analysis_results = analyzer.analyze_signal_comprehensive(
             iq_data,
             center_freq,
             bandwidth,
         )
+        analysis_results = self._attach_analysis_context(analysis_results, analysis_context)
         payload = analysis_results.get('payload', analysis_results)
         if not analysis_results.get('success', True):
             self.logger.warning(
                 f"Signal analysis failed: {analysis_results.get('error', 'Unknown error')}"
             )
+            self._update_roi_queue_status(
+                request_id,
+                'failed',
+                result_note=str(analysis_results.get('error', 'Unknown error')),
+            )
             return
 
         self._update_gui_with_analysis_results(payload)
+        snr_db = payload.get('demodulation', {}).get('snr') if isinstance(payload, dict) else None
+        modulation = payload.get('modulation', {}).get('type') if isinstance(payload, dict) else None
+        self._update_roi_queue_status(
+            request_id,
+            'completed',
+            result_note='Analysis completed',
+            modulation=modulation,
+            snr_db=snr_db,
+        )
         self.logger.info(
             f"Signal analysis completed: {payload.get('modulation', {}).get('type', 'Unknown')} detected"
         )
@@ -1254,24 +1664,230 @@ class RFSpectrumAnalyzerApp(QObject):
         """Handle completion of async analysis requests."""
         try:
             payload = analysis_results.get('payload', analysis_results)
+            analysis_context = payload.get('analysis_context', {}) if isinstance(payload, dict) else {}
+            request_id = analysis_context.get('roi_request_id') if isinstance(analysis_context, dict) else None
             if not analysis_results.get('success', True):
                 self.logger.warning(
                     f"Signal analysis failed: {analysis_results.get('error', 'Unknown error')}"
                 )
+                self._update_roi_queue_status(
+                    request_id,
+                    'failed',
+                    result_note=str(analysis_results.get('error', 'Unknown error')),
+                )
                 return
             self._update_gui_with_analysis_results(payload)
+            snr_db = payload.get('demodulation', {}).get('snr') if isinstance(payload, dict) else None
+            modulation = payload.get('modulation', {}).get('type') if isinstance(payload, dict) else None
+            self._update_roi_queue_status(
+                request_id,
+                'completed',
+                result_note='Analysis completed',
+                modulation=modulation,
+                snr_db=snr_db,
+            )
             self.logger.info(
                 f"Signal analysis completed: {payload.get('modulation', {}).get('type', 'Unknown')} detected"
             )
         except Exception as exc:
             self.logger.error(f"Error handling async analysis completion: {exc}")
+
+    def _attach_analysis_context(
+        self,
+        analysis_results: Dict[str, Any],
+        analysis_context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Attach analysis context for both legacy and envelope payload formats."""
+        if not isinstance(analysis_results, dict):
+            return analysis_results
+        if not isinstance(analysis_context, dict) or len(analysis_context) == 0:
+            return analysis_results
+
+        payload = analysis_results.get('payload')
+        if isinstance(payload, dict):
+            payload['analysis_context'] = dict(analysis_context)
+            return analysis_results
+
+        analysis_results['analysis_context'] = dict(analysis_context)
+        return analysis_results
+
+    def _build_stage_status_envelope(
+        self,
+        is_demo_mode: bool,
+        has_iq_data: bool,
+        roi_bandwidth_hz: float,
+        decimation_factor: float,
+    ) -> Dict[str, Any]:
+        """Build baseline pipeline stage tags used to track analysis progression."""
+        capture_state = 'success' if has_iq_data else 'failed'
+        ingest_state = 'success' if has_iq_data else 'failed'
+        preprocess_state = 'success' if has_iq_data else 'failed'
+
+        source_note = 'demo_iq' if is_demo_mode else 'live_or_snapshot_iq'
+        preprocessing_note = 'roi_extract_and_decimate' if decimation_factor > 1.01 else 'roi_extract_only'
+
+        stages = {
+            'capture': {
+                'state': capture_state,
+                'note': source_note,
+            },
+            'ingest': {
+                'state': ingest_state,
+                'note': 'ring_buffer_snapshot',
+            },
+            'preprocess': {
+                'state': preprocess_state,
+                'note': preprocessing_note,
+            },
+            'detect': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'executed_in_signal_analyzer',
+            },
+            'characterize': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'executed_in_signal_analyzer',
+            },
+            'demodulate': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'executed_in_signal_analyzer',
+            },
+            'dechannelize': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'phase_5_target',
+            },
+            'deinterleave_descramble': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'phase_6_target',
+            },
+            'fec_decode': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'phase_7_target',
+            },
+            'payload_parse': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'phase_8_target',
+            },
+            'output_render': {
+                'state': 'pending' if has_iq_data else 'blocked',
+                'note': 'phase_8_target',
+            },
+        }
+
+        return {
+            'current_stage': 'detect' if has_iq_data else 'capture',
+            'roi_bandwidth_hz': float(roi_bandwidth_hz),
+            'decimation_factor': float(decimation_factor),
+            'stages': stages,
+        }
     
-    def _get_iq_data_for_range(self, center_freq: float, bandwidth: float) -> Optional[np.ndarray]:
+    def _extract_channel_iq(
+        self,
+        iq_data: np.ndarray,
+        source_center_hz: float,
+        target_center_hz: float,
+        target_bandwidth_hz: float,
+        sample_rate_hz: float,
+    ) -> np.ndarray:
+        """Extract selected frequency channel from wideband IQ.
+
+        This mirrors SDR workflows used in tools like SatDump:
+        tune wideband -> select ROI -> shift ROI to baseband -> low-pass filter.
+        """
+        if iq_data is None or len(iq_data) == 0:
+            return np.array([], dtype=np.complex64)
+
+        fs = float(sample_rate_hz)
+        if not np.isfinite(fs) or fs <= 0.0:
+            return np.asarray(iq_data, dtype=np.complex64)
+
+        bw = float(target_bandwidth_hz)
+        if not np.isfinite(bw) or bw <= 0.0:
+            bw = fs * 0.1
+
+        # Keep bandwidth inside Nyquist and avoid degenerate filters.
+        bw = min(max(bw, fs / 500.0), fs * 0.95)
+
+        iq = np.asarray(iq_data, dtype=np.complex64)
+
+        # Translate selected channel center to DC.
+        freq_offset = float(target_center_hz - source_center_hz)
+        if abs(freq_offset) > 0.0:
+            n = np.arange(len(iq), dtype=np.float64)
+            lo = np.exp(-1j * 2.0 * np.pi * freq_offset * (n / fs))
+            iq = (iq * lo).astype(np.complex64, copy=False)
+
+        cutoff_hz = min(bw * 0.55, fs * 0.45)
+        if cutoff_hz <= 0.0:
+            return iq
+
+        if sp_signal is not None:
+            # 6th order Butterworth LPF: smooth enough for interactive ROI analysis.
+            b, a = sp_signal.butter(6, cutoff_hz / (fs * 0.5), btype='low')
+            filtered = sp_signal.filtfilt(b, a, iq)
+            return np.asarray(filtered, dtype=np.complex64)
+
+        # Fallback when scipy is unavailable: FFT brick-wall LPF.
+        spectrum = np.fft.fft(iq)
+        freqs = np.fft.fftfreq(len(iq), d=1.0 / fs)
+        mask = np.abs(freqs) <= cutoff_hz
+        filtered = np.fft.ifft(spectrum * mask)
+        return np.asarray(filtered, dtype=np.complex64)
+
+    def _decimate_roi_if_narrow(
+        self,
+        iq_data: np.ndarray,
+        sample_rate_hz: float,
+        roi_bandwidth_hz: float,
+    ) -> (np.ndarray, float):
+        """Downsample narrow-band ROI to reduce analysis CPU load."""
+        iq = np.asarray(iq_data, dtype=np.complex64)
+        fs = float(sample_rate_hz)
+        bw = float(roi_bandwidth_hz)
+
+        if iq.size == 0 or not np.isfinite(fs) or fs <= 0.0:
+            return iq, fs
+        if not np.isfinite(bw) or bw <= 0.0:
+            return iq, fs
+
+        # Keep at least ~4x BW for robust demod/analysis while cutting compute cost.
+        target_fs = max(48_000.0, bw * 4.0)
+        if fs <= target_fs * 1.15:
+            return iq, fs
+        if sp_signal is None:
+            return iq, fs
+
+        decim = int(np.floor(fs / target_fs))
+        decim = max(1, min(decim, 32))
+        if decim <= 1:
+            return iq, fs
+
+        if len(iq) // decim < 256:
+            return iq, fs
+
+        try:
+            decimated = sp_signal.resample_poly(iq, up=1, down=decim)
+            out = np.asarray(decimated, dtype=np.complex64)
+            out_fs = fs / decim
+            return out, out_fs
+        except Exception as exc:
+            self.logger.debug(f"ROI decimation skipped due to error: {exc}")
+            return iq, fs
+
+    def _get_iq_data_for_range(
+        self,
+        center_freq: float,
+        bandwidth: float,
+        freq_range: Optional[Any] = None,
+        return_sample_rate: bool = False,
+    ):
         """Get IQ data for specific frequency range."""
         try:
             if self.demo_mode:
                 # Generate synthetic IQ data for demo
-                return self._generate_demo_iq_data(center_freq, bandwidth)
+                demo_iq = self._generate_demo_iq_data(center_freq, bandwidth)
+                if return_sample_rate:
+                    return demo_iq, float(self.settings.sdr.sample_rate)
+                return demo_iq
 
             # Snapshot path: avoid synchronous retune/read in UI thread.
             snapshot_ring = getattr(self, 'iq_snapshot_ring', None)
@@ -1294,10 +1910,41 @@ class RFSpectrumAnalyzerApp(QObject):
             if len(iq_data) > required_samples:
                 iq_data = iq_data[-required_samples:]
 
-            return iq_data
+            source_center_hz = float(getattr(self.settings.sdr, 'center_frequency', center_freq))
+            target_center_hz = float(center_freq)
+            target_bandwidth_hz = float(bandwidth)
+
+            # Prefer explicit ROI limits from spectrum region when available.
+            if isinstance(freq_range, (tuple, list)) and len(freq_range) == 2:
+                f1 = float(freq_range[0])
+                f2 = float(freq_range[1])
+                if f1 > f2:
+                    f1, f2 = f2, f1
+                if np.isfinite(f1) and np.isfinite(f2) and f2 > f1:
+                    target_center_hz = 0.5 * (f1 + f2)
+                    target_bandwidth_hz = f2 - f1
+
+            extracted = self._extract_channel_iq(
+                iq_data=iq_data,
+                source_center_hz=source_center_hz,
+                target_center_hz=target_center_hz,
+                target_bandwidth_hz=target_bandwidth_hz,
+                sample_rate_hz=float(self.settings.sdr.sample_rate),
+            )
+            optimized_iq, optimized_fs = self._decimate_roi_if_narrow(
+                extracted,
+                float(self.settings.sdr.sample_rate),
+                target_bandwidth_hz,
+            )
+
+            if return_sample_rate:
+                return optimized_iq, float(optimized_fs)
+            return optimized_iq
             
         except Exception as e:
             self.logger.error(f"Error getting IQ data for range: {e}")
+            if return_sample_rate:
+                return None, float(self.settings.sdr.sample_rate)
             return None
     
     def _generate_demo_iq_data(self, center_freq: float, bandwidth: float) -> np.ndarray:
@@ -1395,6 +2042,13 @@ class RFSpectrumAnalyzerApp(QObject):
                 return
             if not analysis_results.get('success', True):
                 self.logger.warning(f"Signal analysis reported error: {analysis_results.get('error', 'Unknown error')}")
+                analysis_context = results.get('analysis_context', {})
+                if isinstance(analysis_context, dict):
+                    self._update_roi_queue_status(
+                        analysis_context.get('roi_request_id'),
+                        'failed',
+                        result_note=str(analysis_results.get('error', 'Unknown error')),
+                    )
                 return
             
             # Update constellation widget
@@ -1422,6 +2076,23 @@ class RFSpectrumAnalyzerApp(QObject):
                     else:
                         bits = np.clip(decoded_bits, 0, 1).astype(int).tolist()
                     self.main_window.bitstream_widget.add_bits(bits)
+
+            artifacts = list(results.get('decoded_outputs', []) or [])
+            protocol_artifacts = results.get('protocol_outputs', {}).get('artifacts', []) if isinstance(results.get('protocol_outputs', {}), dict) else []
+            artifacts.extend(protocol_artifacts or [])
+
+            image_artifact = next((a for a in artifacts if a.get('type') == 'image'), None)
+            pcm_artifact = next((a for a in artifacts if a.get('type') == 'pcm'), None)
+            image_summary = None
+            if image_artifact:
+                self.latest_image_artifact = image_artifact
+                image_summary = image_artifact.get('payload', {}).get('summary', {})
+                if hasattr(self.main_window, 'update_image_artifact_view'):
+                    self.main_window.update_image_artifact_view(image_artifact)
+            if pcm_artifact:
+                self.latest_pcm_artifact = pcm_artifact
+
+            self._record_analysis_snapshot(results, image_artifact)
             
             # Update info display
             info_text = f"Modulation: {results['modulation']['type']} " \
@@ -1432,6 +2103,21 @@ class RFSpectrumAnalyzerApp(QObject):
             
             if 'coding' in results and results['coding']:
                 info_text += f", Coding: {results['coding']['coding_type']}"
+
+            if image_summary:
+                width = image_summary.get('width')
+                height = image_summary.get('height')
+                if width is not None and height is not None:
+                    info_text += f", NOAA Image: {int(width)}x{int(height)} ready"
+
+            analysis_context = results.get('analysis_context', {}) if isinstance(results, dict) else {}
+            if isinstance(analysis_context, dict) and analysis_context:
+                analysis_fs = analysis_context.get('analysis_sample_rate_hz')
+                decimation = analysis_context.get('decimation_factor')
+                if analysis_fs is not None:
+                    info_text += f", Fs: {float(analysis_fs)/1e3:.1f} kS/s"
+                if decimation is not None:
+                    info_text += f", Decim: x{float(decimation):.1f}"
             
             # Display in spectrum widget info label
             self.main_window.spectrum_widget.info_label.setText(info_text)
@@ -1440,6 +2126,325 @@ class RFSpectrumAnalyzerApp(QObject):
             
         except Exception as e:
             self.logger.error(f"Error updating GUI with analysis results: {e}")
+
+    def _record_analysis_snapshot(self, results: Dict[str, Any], image_artifact: Optional[Dict[str, Any]] = None):
+        """Store compact per-analysis snapshot for session-level reporting."""
+        try:
+            modulation = results.get('modulation', {}) if isinstance(results, dict) else {}
+            demod = results.get('demodulation', {}) if isinstance(results, dict) else {}
+            decode_quality = results.get('decode_quality', {}) if isinstance(results, dict) else {}
+            protocol_outputs = results.get('protocol_outputs', {}) if isinstance(results, dict) else {}
+            decode_depth = results.get('decode_depth', {}) if isinstance(results, dict) else {}
+
+            artifact_refs = []
+            for artifact in list(results.get('decoded_outputs', []) or []):
+                payload = artifact.get('payload', {}) if isinstance(artifact, dict) else {}
+                artifact_refs.append(
+                    {
+                        'type': artifact.get('type'),
+                        'confidence': artifact.get('confidence'),
+                        'protocol': payload.get('protocol') if isinstance(payload, dict) else None,
+                    }
+                )
+
+            if image_artifact:
+                payload = image_artifact.get('payload', {})
+                summary = payload.get('summary', {}) if isinstance(payload, dict) else {}
+                image_ref = {
+                    'type': 'image',
+                    'protocol': payload.get('protocol') if isinstance(payload, dict) else None,
+                    'width': summary.get('width') if isinstance(summary, dict) else None,
+                    'height': summary.get('height') if isinstance(summary, dict) else None,
+                    'preview_rows': payload.get('preview_rows') if isinstance(payload, dict) else None,
+                }
+                if image_ref not in artifact_refs:
+                    artifact_refs.append(image_ref)
+
+            record = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'modulation_type': modulation.get('type'),
+                'modulation_confidence': modulation.get('confidence'),
+                'snr': demod.get('snr'),
+                'decode_quality': {
+                    'bit_count': decode_quality.get('bit_count'),
+                    'artifact_count': decode_quality.get('artifact_count'),
+                    'frame_count': decode_quality.get('frame_count'),
+                    'uncertain_frame_ratio': decode_quality.get('uncertain_frame_ratio'),
+                    'ber': decode_quality.get('ber'),
+                    'per': decode_quality.get('per'),
+                    'crc_ok_rate': decode_quality.get('crc_ok_rate'),
+                    'frame_lock_ratio': decode_quality.get('frame_lock_ratio'),
+                },
+                'stage_metrics': {
+                    'decode_depth': decode_depth,
+                    'protocol': {
+                        'matched_protocol': protocol_outputs.get('matched_protocol') if isinstance(protocol_outputs, dict) else None,
+                        'confidence': protocol_outputs.get('confidence') if isinstance(protocol_outputs, dict) else None,
+                    },
+                },
+                'artifact_references': artifact_refs,
+            }
+
+            self.analysis_session_records.append(record)
+        except Exception as exc:
+            self.logger.debug(f"Failed to record analysis snapshot: {exc}")
+
+    def export_latest_image_artifact(self, filename: str):
+        """Export the most recent decoded image artifact from analysis results."""
+        try:
+            if not self.latest_image_artifact:
+                if self.main_window:
+                    self.main_window.show_error_message("No decoded image artifact available to export.")
+                return
+
+            payload = self.latest_image_artifact.get('payload', {})
+            summary = payload.get('summary', {}) if isinstance(payload, dict) else {}
+            self.data_exporter.set_metadata(
+                {
+                    "protocol": payload.get('protocol', 'unknown') if isinstance(payload, dict) else 'unknown',
+                    "width": summary.get('width'),
+                    "height": summary.get('height'),
+                }
+            )
+
+            success = self.data_exporter.export_artifact_image(self.latest_image_artifact, filename)
+            if success:
+                self.logger.info(f"Decoded image artifact exported: {filename}")
+                if self.main_window:
+                    self.main_window.show_info_message(f"Exported decoded image: {filename}")
+            else:
+                self.logger.error(f"Decoded image artifact export failed: {filename}")
+                if self.main_window:
+                    self.main_window.show_error_message("Failed to export decoded image artifact.")
+
+        except Exception as exc:
+            self.logger.error(f"Error exporting decoded image artifact: {exc}")
+            if self.main_window:
+                self.main_window.show_error_message(f"Export error: {exc}")
+
+    def export_session_decode_report(self, filename: str):
+        """Export session decode report with per-stage trends and artifact references."""
+        try:
+            records = list(self.analysis_session_records)
+            if not records:
+                if self.main_window:
+                    self.main_window.show_error_message("No session analysis records available for export.")
+                return
+
+            success = self.data_exporter.export_decode_session_report(records=records, filename=filename)
+            if success:
+                self.logger.info(f"Decode session report exported: {filename}")
+                if self.main_window:
+                    self.main_window.show_info_message(f"Exported decode session report: {filename}")
+            else:
+                self.logger.error(f"Decode session report export failed: {filename}")
+                if self.main_window:
+                    self.main_window.show_error_message("Failed to export decode session report.")
+        except Exception as exc:
+            self.logger.error(f"Error exporting decode session report: {exc}")
+            if self.main_window:
+                self.main_window.show_error_message(f"Export error: {exc}")
+
+    def export_latest_pcm_artifact(self, filename: str):
+        """Export latest PCM artifact as WAV."""
+        try:
+            if not self.latest_pcm_artifact:
+                if self.main_window:
+                    self.main_window.show_error_message("No decoded PCM artifact available to export.")
+                return
+
+            success = self.data_exporter.export_pcm_wav_from_artifact(self.latest_pcm_artifact, filename)
+            if success:
+                self.logger.info(f"Decoded PCM artifact exported: {filename}")
+                if self.main_window:
+                    self.main_window.show_info_message(f"Exported decoded audio: {filename}")
+            else:
+                self.logger.error(f"Decoded PCM artifact export failed: {filename}")
+                if self.main_window:
+                    self.main_window.show_error_message("Failed to export decoded audio artifact.")
+        except Exception as exc:
+            self.logger.error(f"Error exporting decoded PCM artifact: {exc}")
+            if self.main_window:
+                self.main_window.show_error_message(f"Export error: {exc}")
+
+    def load_session_decode_report(self, filename: str):
+        """Load and replay a previously exported decode session report."""
+        try:
+            payload = self.data_importer.import_decode_session_report(filename)
+            records = payload.get('records', []) if isinstance(payload, dict) else []
+            if not records:
+                if self.main_window:
+                    self.main_window.show_error_message("No records found in decode session report.")
+                return
+
+            self.analysis_session_records.clear()
+            self.analysis_session_records.extend(records)
+
+            if self.main_window and hasattr(self.main_window, 'clear_image_artifact_history'):
+                self.main_window.clear_image_artifact_history()
+
+            replayed_images = 0
+            for record in records:
+                for ref in record.get('artifact_references', []) or []:
+                    if ref.get('type') != 'image':
+                        continue
+                    preview_rows = ref.get('preview_rows')
+                    if not preview_rows:
+                        continue
+                    artifact = {
+                        'type': 'image',
+                        'confidence': 0.0,
+                        'payload': {
+                            'protocol': ref.get('protocol', 'unknown'),
+                            'summary': {
+                                'width': ref.get('width'),
+                                'height': ref.get('height'),
+                            },
+                            'preview_rows': preview_rows,
+                        },
+                    }
+                    if self.main_window and hasattr(self.main_window, 'update_image_artifact_view'):
+                        self.main_window.update_image_artifact_view(artifact)
+                        replayed_images += 1
+
+            if self.main_window:
+                self.main_window.show_info_message(
+                    f"Loaded decode session report with {len(records)} records and replayed {replayed_images} image previews."
+                )
+            self.logger.info(f"Loaded decode session report: {filename}")
+        except Exception as exc:
+            self.logger.error(f"Error loading decode session report: {exc}")
+            if self.main_window:
+                self.main_window.show_error_message(f"Load error: {exc}")
+
+    def process_signal_file(
+        self,
+        filename: str,
+        center_freq: float = 0.0,
+        bandwidth: float = 0.0,
+        advanced_params: Optional[Dict[str, float]] = None,
+    ):
+        """Load a signal file and run the full analysis pipeline in a background thread."""
+        from PySide6.QtWidgets import QProgressDialog
+        from PySide6.QtCore import Qt
+
+        advanced_params = advanced_params or {}
+
+        # Persist last-used advanced file-source parameters for next file open.
+        try:
+            if hasattr(self.settings, 'file_source'):
+                self.settings.file_source.sample_rate_hz = float(advanced_params.get('sample_rate_hz', 0.0) or 0.0)
+                self.settings.file_source.freq_offset_hz = float(advanced_params.get('freq_offset_hz', 0.0) or 0.0)
+                self.settings.file_source.start_sec = float(advanced_params.get('start_sec', 0.0) or 0.0)
+                self.settings.file_source.duration_sec = float(advanced_params.get('duration_sec', 0.0) or 0.0)
+                self.settings.save()
+        except Exception as exc:
+            self.logger.warning(f"Could not persist file-source advanced settings: {exc}")
+
+        if center_freq == 0.0:
+            center_freq = float(self.settings.sdr.center_frequency)
+        if bandwidth == 0.0:
+            bandwidth = float(max(self.settings.sdr.sample_rate / 2.0, 1.0))
+
+        # For file analysis, pause live SDR acquisition to avoid UI starvation.
+        self._resume_acquisition_after_file = bool(
+            self.acquisition_thread and self.acquisition_thread.isRunning()
+        )
+        if self._resume_acquisition_after_file:
+            self.stop_acquisition()
+
+        # Headless mode: run synchronously and return dict for CLI flow.
+        if self.headless_mode or not self.main_window:
+            try:
+                iq_data, metadata = self.data_importer.import_signal_source(filename)
+                if iq_data is None or len(iq_data) == 0:
+                    return {'success': False, 'error': f'Failed to import signal source from {filename}'}
+
+                sample_rate = float(metadata.get('sample_rate') or self.settings.sdr.sample_rate)
+                worker = FileAnalysisWorker(
+                    self.data_importer,
+                    SignalAnalyzer,
+                    self.settings,
+                    filename,
+                    center_freq,
+                    bandwidth,
+                    advanced_params,
+                )
+                iq_prepared, sample_rate = worker._apply_advanced(iq_data, sample_rate)
+                if iq_prepared is None or len(iq_prepared) == 0:
+                    return {'success': False, 'error': 'Selected segment is empty after applying advanced file settings'}
+
+                analyzer = SignalAnalyzer(sample_rate)
+                result = analyzer.analyze_signal_comprehensive(
+                    iq_prepared,
+                    center_freq,
+                    bandwidth,
+                )
+                payload = result.get('payload', result)
+                payload['source_metadata'] = metadata
+                payload['source_file'] = filename
+                payload['source_advanced'] = advanced_params
+                self.latest_signal_source = metadata
+                return result
+            finally:
+                if self._resume_acquisition_after_file:
+                    self.start_acquisition()
+                    self._resume_acquisition_after_file = False
+
+        # Stop previous file worker if still alive.
+        if self._file_worker is not None and self._file_worker.isRunning():
+            self._file_worker.quit()
+            self._file_worker.wait(1500)
+
+        self._file_worker = FileAnalysisWorker(
+            self.data_importer,
+            SignalAnalyzer,
+            self.settings,
+            filename,
+            center_freq,
+            bandwidth,
+            advanced_params,
+        )
+
+        progress = QProgressDialog(
+            f"Analysing {Path(filename).name}...",
+            "",
+            0,
+            0,
+            self.main_window,
+        )
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        def _cleanup_after_file():
+            progress.close()
+            if self._resume_acquisition_after_file:
+                self.start_acquisition()
+                self._resume_acquisition_after_file = False
+
+        def _on_done(result):
+            _cleanup_after_file()
+            payload = result.get('payload', result)
+            self.latest_signal_source = payload.get('source_metadata', {})
+            self._update_gui_with_analysis_results(payload)
+            mod = payload.get('modulation', {}).get('type', 'Unknown')
+            self.logger.info(f"Processed signal file {filename}: modulation={mod}")
+            self.main_window.show_info_message(
+                f"Processed: {Path(filename).name} ({payload.get('analysis_status', 'unknown')})"
+            )
+
+        def _on_error(msg):
+            _cleanup_after_file()
+            self.logger.error(f"Error processing signal file {filename}: {msg}")
+            self.main_window.show_error_message(f"File processing error: {msg}")
+
+        self._file_worker.analysis_done.connect(_on_done)
+        self._file_worker.error_occurred.connect(_on_error)
+        self._file_worker.finished.connect(self._file_worker.deleteLater)
+        self._file_worker.start()
+        return None
     
     def change_detection_threshold(self, threshold_dbm):
         """Change signal detection threshold."""
