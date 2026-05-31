@@ -7,7 +7,6 @@ import os
 import json
 import csv
 import pickle
-import h5py
 import numpy as np
 import scipy.io
 from pathlib import Path
@@ -18,6 +17,13 @@ import logging
 from rf_spectrum_analyzer.utils.logger import get_logger
 
 logger = get_logger('file_io')
+
+try:
+    import h5py
+    H5PY_AVAILABLE = True
+except ImportError:
+    h5py = None
+    H5PY_AVAILABLE = False
 
 class DataExporter:
     """Export spectrum data to various file formats"""
@@ -154,6 +160,10 @@ class DataExporter:
         compression: str = 'gzip'
     ) -> bool:
         """Export to HDF5 format"""
+        if not H5PY_AVAILABLE:
+            logger.error("h5py is not installed. Cannot export HDF5 format.")
+            return False
+
         with h5py.File(filepath, 'w') as f:
             # Create datasets
             f.create_dataset('frequencies', data=frequencies, compression=compression)
@@ -338,6 +348,10 @@ class DataImporter:
     
     def _import_h5(self, filepath: Path) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """Import from HDF5 format"""
+        if not H5PY_AVAILABLE:
+            logger.error("h5py is not installed. Cannot import HDF5 format.")
+            return np.array([]), np.array([]), {}
+
         with h5py.File(filepath, 'r') as f:
             frequencies = f['frequencies'][:]
             power_spectrum = f['power_spectrum'][:]

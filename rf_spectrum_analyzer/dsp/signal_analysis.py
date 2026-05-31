@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 from scipy import signal, fft
 from scipy.stats import kurtosis, skew
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 # Import advanced DSP capabilities
 try:
@@ -113,12 +114,45 @@ class SignalAnalyzer:
         else:
             self.advanced_features_enabled = False
             self.logger.info("Basic DSP features only")
+
+    def _result_ok(self, payload: Optional[Dict[str, Any]] = None,
+                   meta: Optional[Dict[str, Any]] = None,
+                   **legacy_fields) -> Dict[str, Any]:
+        """Return standardized success result with backward-compatible top-level fields."""
+        return make_api_result(
+            success=True,
+            payload=payload,
+            meta=meta,
+            **legacy_fields,
+        )
+
+    def _result_error(self, error: str,
+                      payload: Optional[Dict[str, Any]] = None,
+                      meta: Optional[Dict[str, Any]] = None,
+                      **legacy_fields) -> Dict[str, Any]:
+        """Return standardized error result with optional payload/meta."""
+        return make_api_result(
+            success=False,
+            error=error,
+            payload=payload,
+            meta=meta,
+            **legacy_fields,
+        )
     
     def analyze_signal_comprehensive(self, iq_data: np.ndarray, center_freq: float, 
                                    bandwidth: float) -> Dict[str, Any]:
         """Comprehensive signal analysis including modulation, demodulation, and coding."""
         if len(iq_data) == 0:
-            return {'error': 'No IQ data provided'}
+            payload = {
+                'analysis_status': 'failed',
+                'advanced_features_used': self.advanced_features_enabled,
+            }
+            return self._result_error(
+                'No IQ data provided',
+                payload=payload,
+                meta={'api': 'SignalAnalyzer.analyze_signal_comprehensive'},
+                **payload,
+            )
         
         try:
             # Step 1: Enhanced preprocessing with advanced filtering
@@ -188,15 +222,24 @@ class SignalAnalyzer:
                 'analysis_status': 'success'
             }
             
-            return analysis_results
+            return self._result_ok(
+                payload=analysis_results,
+                meta={'api': 'SignalAnalyzer.analyze_signal_comprehensive'},
+                **analysis_results,
+            )
             
         except Exception as e:
             self.logger.error(f"Signal analysis failed: {e}")
-            return {
-                'error': str(e),
+            payload = {
                 'analysis_status': 'failed',
-                'advanced_features_used': self.advanced_features_enabled
+                'advanced_features_used': self.advanced_features_enabled,
             }
+            return self._result_error(
+                str(e),
+                payload=payload,
+                meta={'api': 'SignalAnalyzer.analyze_signal_comprehensive'},
+                **payload,
+            )
     
     def _preprocess_signal(self, iq_data: np.ndarray) -> np.ndarray:
         """Preprocess IQ data for analysis."""

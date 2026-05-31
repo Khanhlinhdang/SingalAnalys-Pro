@@ -1,104 +1,29 @@
 {
-  "timestamp": 1757976507.2254577,
-  "overall_result": false,
-  "total_duration": 14.858218431472778,
+  "timestamp": 1780213463.6245923,
+  "overall_result": true,
+  "total_duration": 1.9369332790374756,
   "summary": {
-    "total_tests": 209,
-    "total_failures": 21,
-    "total_errors": 78,
-    "total_skipped": 119,
-    "passed_modules": 0,
-    "total_modules": 10
+    "total_tests": 11,
+    "total_failures": 0,
+    "total_errors": 0,
+    "total_skipped": 11,
+    "passed_modules": 1,
+    "total_modules": 1
   },
   "modules": {
-    "imports": {
-      "tests_run": 11,
-      "failures": 21,
-      "errors": 0,
-      "skipped": 0,
-      "duration": 12.08189606666565,
-      "success": false
-    },
-    "dsp_filters": {
-      "tests_run": 27,
-      "failures": 0,
-      "errors": 10,
-      "skipped": 17,
-      "duration": 0.06604981422424316,
-      "success": false
-    },
-    "dsp_modulation": {
-      "tests_run": 36,
-      "failures": 0,
-      "errors": 19,
-      "skipped": 17,
-      "duration": 0.10397195816040039,
-      "success": false
-    },
-    "dsp_analysis": {
-      "tests_run": 33,
-      "failures": 0,
-      "errors": 3,
-      "skipped": 30,
-      "duration": 0.019483327865600586,
-      "success": false
-    },
-    "dsp_utils": {
-      "tests_run": 47,
-      "failures": 0,
-      "errors": 38,
-      "skipped": 9,
-      "duration": 0.26801013946533203,
-      "success": false
-    },
-    "core": {
-      "tests_run": 0,
-      "failures": 0,
-      "errors": 1,
-      "skipped": 0,
-      "duration": 0,
-      "success": false,
-      "error": "name 'SDRBackend' is not defined"
-    },
-    "backends": {
-      "tests_run": 22,
-      "failures": 0,
-      "errors": 4,
-      "skipped": 18,
-      "duration": 0.024067163467407227,
-      "success": false
-    },
-    "gui": {
-      "tests_run": 33,
-      "failures": 0,
-      "errors": 1,
-      "skipped": 28,
-      "duration": 1.4897050857543945,
-      "success": false
-    },
     "integration": {
-      "tests_run": 0,
+      "tests_run": 11,
       "failures": 0,
-      "errors": 1,
-      "skipped": 0,
-      "duration": 0,
-      "success": false,
-      "error": "name 'SDRBackend' is not defined"
-    },
-    "debug_performance": {
-      "tests_run": 0,
-      "failures": 0,
-      "errors": 1,
-      "skipped": 0,
-      "duration": 0,
-      "success": false,
-      "error": "name 'SDRBackend' is not defined"
+      "errors": 0,
+      "skipped": 11,
+      "duration": 0.0003333091735839844,
+      "success": true
     }
   },
   "config": {
     "coverage": false,
     "performance": false,
     "debug": false,
-    "ci_mode": false
+    "ci_mode": true
   }
 }

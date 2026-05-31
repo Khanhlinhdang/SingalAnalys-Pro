@@ -8,6 +8,7 @@ import logging
 from typing import Optional, Dict, Any, List
 from rf_spectrum_analyzer.core.sdr_backend import SDRBackend
 from rf_spectrum_analyzer.config.settings import Settings
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +290,13 @@ class HackRFBackend(SDRBackend):
     def get_device_info(self) -> Dict[str, Any]:
         """Get HackRF device information."""
         if not self.device:
-            return {"device_type": "HackRF", "status": "disconnected"}
+            info = {"device_type": "HackRF", "status": "disconnected"}
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'HackRFBackend.get_device_info', 'backend': 'hackrf', 'connected': False},
+                **info,
+            )
         
         try:
             info = {
@@ -318,11 +325,23 @@ class HackRFBackend(SDRBackend):
             except Exception:
                 pass  # Don't fail if can't read device info
             
-            return info
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'HackRFBackend.get_device_info', 'backend': 'hackrf', 'connected': True},
+                **info,
+            )
             
         except Exception as e:
             logger.error(f"Error getting HackRF device info: {e}")
-            return {"device_type": "HackRF", "status": "error", "error": str(e)}
+            info = {"device_type": "HackRF", "status": "error"}
+            return make_api_result(
+                success=False,
+                error=str(e),
+                payload=info,
+                meta={'api': 'HackRFBackend.get_device_info', 'backend': 'hackrf', 'connected': False},
+                **info,
+            )
     
     def get_frequency_range(self) -> tuple:
         """Get supported frequency range."""

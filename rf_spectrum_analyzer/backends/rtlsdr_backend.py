@@ -8,6 +8,7 @@ import logging
 from typing import Optional, Dict, Any, List
 from rf_spectrum_analyzer.core.sdr_backend import SDRBackend
 from rf_spectrum_analyzer.config.settings import Settings
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +352,13 @@ class RTLSDRBackend(SDRBackend):
     def get_device_info(self) -> Dict[str, Any]:
         """Get comprehensive RTL-SDR device information."""
         if not self.sdr:
-            return {"device_type": "RTL-SDR", "status": "disconnected"}
+            info = {"device_type": "RTL-SDR", "status": "disconnected"}
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'RTLSDRBackend.get_device_info', 'backend': 'rtlsdr', 'connected': False},
+                **info,
+            )
         
         try:
             info = {
@@ -380,11 +387,23 @@ class RTLSDRBackend(SDRBackend):
             except Exception:
                 pass  # Don't fail if we can't get additional info
             
-            return info
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'RTLSDRBackend.get_device_info', 'backend': 'rtlsdr', 'connected': True},
+                **info,
+            )
             
         except Exception as e:
             logger.error(f"Error getting RTL-SDR device info: {e}")
-            return {"device_type": "RTL-SDR", "status": "error", "error": str(e)}
+            info = {"device_type": "RTL-SDR", "status": "error"}
+            return make_api_result(
+                success=False,
+                error=str(e),
+                payload=info,
+                meta={'api': 'RTLSDRBackend.get_device_info', 'backend': 'rtlsdr', 'connected': False},
+                **info,
+            )
     
     def get_frequency_range(self) -> tuple:
         """Get supported frequency range for RTL-SDR."""

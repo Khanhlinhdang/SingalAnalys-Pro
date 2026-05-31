@@ -16,6 +16,7 @@ except ImportError:
 
 from rf_spectrum_analyzer.core.sdr_backend import SDRBackend, SDRDevice, SDRDeviceType, StreamingError
 from rf_spectrum_analyzer.config.settings import Settings
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 logger = logging.getLogger(__name__)
 
@@ -397,17 +398,23 @@ class SpyServerBackend(SDRBackend):
     def get_device_info(self) -> Dict[str, Any]:
         """Get SpyServer device information."""
         if not self.connected or not self.spyserver_client:
-            return {
+            info = {
                 "name": "SpyServer",
                 "type": "spyserver",
                 "connected": False,
                 "host": self.host,
                 "port": self.port
             }
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'SpyServerBackend.get_device_info', 'backend': 'spyserver', 'connected': False},
+                **info,
+            )
         
         try:
             device_info = self.spyserver_client.get_device_info()
-            return {
+            info = {
                 "name": "SpyServer",
                 "type": "spyserver", 
                 "connected": True,
@@ -422,16 +429,28 @@ class SpyServerBackend(SDRBackend):
                 "max_frequency": device_info.get("MaximumFrequency", 0),
                 "resolution": device_info.get("Resolution", 0)
             }
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'SpyServerBackend.get_device_info', 'backend': 'spyserver', 'connected': True},
+                **info,
+            )
         except Exception as e:
             logger.error(f"Error getting SpyServer device info: {e}")
-            return {
+            info = {
                 "name": "SpyServer",
                 "type": "spyserver",
                 "connected": self.connected,
                 "host": self.host,
-                "port": self.port,
-                "error": str(e)
+                "port": self.port
             }
+            return make_api_result(
+                success=False,
+                error=str(e),
+                payload=info,
+                meta={'api': 'SpyServerBackend.get_device_info', 'backend': 'spyserver', 'connected': bool(self.connected)},
+                **info,
+            )
     
     def is_connection_healthy(self) -> bool:
         """Check if SpyServer connection is healthy."""

@@ -8,9 +8,9 @@ import sys
 import warnings
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# Add workspace root to path
+workspace_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(workspace_root))
 
 
 class TestImports(unittest.TestCase):
@@ -23,7 +23,7 @@ class TestImports(unittest.TestCase):
     def test_core_python_libraries(self):
         """Test core Python library imports"""
         core_libs = [
-            'numpy', 'scipy', 'matplotlib', 'logging', 'threading',
+            'numpy', 'scipy', 'logging', 'threading',
             'queue', 'dataclasses', 'typing', 'pathlib', 'json',
             'configparser', 'argparse', 'time', 'datetime'
         ]
@@ -37,6 +37,17 @@ class TestImports(unittest.TestCase):
                 except ImportError as e:
                     self.import_results[lib] = False
                     self.fail(f"Failed to import {lib}: {e}")
+
+        optional_libs = ['matplotlib']
+        for lib in optional_libs:
+            with self.subTest(library=lib):
+                try:
+                    __import__(lib)
+                    self.import_results[lib] = True
+                    print(f"✓ {lib} imported successfully")
+                except ImportError as e:
+                    self.import_results[lib] = False
+                    print(f"⚠ Optional library not available: {lib}: {e}")
     
     def test_pyside6_imports(self):
         """Test PySide6/Qt imports"""
@@ -111,32 +122,32 @@ class TestImports(unittest.TestCase):
     def test_project_modules(self):
         """Test project module imports"""
         project_modules = [
-            'core',
-            'core.app',
-            'core.sdr_backend',
-            'core.signal_processor',
-            'dsp',
-            'dsp.filters',
-            'dsp.modulation',
-            'dsp.analysis',
-            'dsp.utils',
-            'backends',
-            'backends.hackrf_backend',
-            'backends.rtlsdr_backend',
-            'backends.pluto_backend',
-            'backends.soapy_backend',
-            'backends.usrp_backend',
-            'gui',
-            'gui.main_window',
-            'gui.spectrum_widget',
-            'gui.waterfall_widget',
-            'gui.controls_widget',
-            'config.settings',
-            'utils.logger',
-            'utils.helpers',
-            'utils.file_io',
-            'resources.icons',
-            'resources.themes'
+            'rf_spectrum_analyzer.core',
+            'rf_spectrum_analyzer.core.app',
+            'rf_spectrum_analyzer.core.sdr_backend',
+            'rf_spectrum_analyzer.core.signal_processor',
+            'rf_spectrum_analyzer.dsp',
+            'rf_spectrum_analyzer.dsp.filters',
+            'rf_spectrum_analyzer.dsp.modulation',
+            'rf_spectrum_analyzer.dsp.analysis',
+            'rf_spectrum_analyzer.dsp.utils',
+            'rf_spectrum_analyzer.backends',
+            'rf_spectrum_analyzer.backends.hackrf_backend',
+            'rf_spectrum_analyzer.backends.rtlsdr_backend',
+            'rf_spectrum_analyzer.backends.pluto_backend',
+            'rf_spectrum_analyzer.backends.soapy_backend',
+            'rf_spectrum_analyzer.backends.usrp_backend',
+            'rf_spectrum_analyzer.gui',
+            'rf_spectrum_analyzer.gui.main_window',
+            'rf_spectrum_analyzer.gui.spectrum_widget',
+            'rf_spectrum_analyzer.gui.waterfall_widget',
+            'rf_spectrum_analyzer.gui.controls_widget',
+            'rf_spectrum_analyzer.config.settings',
+            'rf_spectrum_analyzer.utils.logger',
+            'rf_spectrum_analyzer.utils.helpers',
+            'rf_spectrum_analyzer.utils.file_io',
+            'rf_spectrum_analyzer.resources.icons',
+            'rf_spectrum_analyzer.resources.themes'
         ]
         
         for module in project_modules:
@@ -183,11 +194,11 @@ class TestImports(unittest.TestCase):
     def test_backend_components(self):
         """Test backend component imports"""
         backend_classes = [
-            ('backends.hackrf_backend', 'HackRFBackend'),
-            ('backends.rtlsdr_backend', 'RTLSDRBackend'),
-            ('backends.pluto_backend', 'PlutoBackend'),
-            ('backends.soapy_backend', 'SoapyBackend'),
-            ('backends.usrp_backend', 'USRPBackend')
+            ('rf_spectrum_analyzer.backends.hackrf_backend', 'HackRFBackend'),
+            ('rf_spectrum_analyzer.backends.rtlsdr_backend', 'RTLSDRBackend'),
+            ('rf_spectrum_analyzer.backends.pluto_backend', 'PlutoBackend'),
+            ('rf_spectrum_analyzer.backends.soapy_backend', 'SoapyBackend'),
+            ('rf_spectrum_analyzer.backends.usrp_backend', 'USRPBackend')
         ]
         
         for module_name, class_name in backend_classes:

@@ -134,6 +134,8 @@ class DetectionSettings:
     
     # Advanced features
     advanced_analysis_mode: bool = False
+    advanced_analysis_enabled: bool = False
+    advanced_analysis_interval_frames: int = 10
     spectrum_sensing_enabled: bool = True
     cognitive_radio_mode: bool = False
     

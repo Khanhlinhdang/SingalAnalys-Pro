@@ -99,6 +99,7 @@ class RFSpectrumAnalyzerApp(QObject):
             'modulation_info': {}
         }
         self.bitstream_data = np.array([], dtype=np.uint8)
+        self._bitstream_gui_sent_count = 0
         
         # Demo mode
         self.demo_mode = getattr(settings, 'demo_mode', False)
@@ -124,6 +125,12 @@ class RFSpectrumAnalyzerApp(QObject):
             
             # Initialize signal processor
             self.signal_processor = SignalProcessor(self.settings)
+            self.signal_processor.set_auto_detection(
+                getattr(self.settings.detection, 'auto_detection_enabled', False)
+            )
+            self.signal_processor.set_advanced_analysis(
+                getattr(self.settings.detection, 'advanced_analysis_enabled', False)
+            )
             
             # Initialize signal analyzer
             self.signal_analyzer = SignalAnalyzer(self.settings.sdr.sample_rate)
@@ -288,9 +295,10 @@ class RFSpectrumAnalyzerApp(QObject):
         """Start SDR data acquisition."""
         try:
             self.logger.info("Starting SDR acquisition...")
+            self._bitstream_gui_sent_count = 0
             
             # Connect to SDR device
-            if not self.sdr_manager.connect():
+            if not self.sdr_manager.is_connected() and not self.sdr_manager.connect():
                 self.logger.error("Failed to connect to SDR device")
                 return False
             
@@ -334,6 +342,8 @@ class RFSpectrumAnalyzerApp(QObject):
             # Update UI state
             if self.main_window:
                 self.main_window.set_acquisition_state(False)
+
+            self._bitstream_gui_sent_count = 0
             
             self.logger.info("SDR acquisition stopped")
             
@@ -378,10 +388,14 @@ class RFSpectrumAnalyzerApp(QObject):
                 if len(self.waterfall_data) > max_waterfall_lines:
                     self.waterfall_data.pop(0)
             
-            # Process constellation data (run every few frames for performance)
-            self.logger.debug(f"Frame count: {self.frame_count}, modulo: {self.frame_count % 3}")
-            # TEMPORARILY DISABLED: Advanced analysis causes GUI freeze
-            if False and self.frame_count % 10 == 0:  # Disabled to prevent GUI freeze
+            # Process advanced analysis only when feature flag is enabled.
+            interval_frames = max(
+                1,
+                int(getattr(self.settings.detection, 'advanced_analysis_interval_frames', 10))
+            )
+            if (self.signal_processor and
+                getattr(self.signal_processor, '_advanced_analysis_enabled', False) and
+                self.frame_count % interval_frames == 0):
                 self.logger.debug("Triggering advanced analysis...")
                 try:
                     self.process_advanced_analysis(samples)
@@ -415,8 +429,11 @@ class RFSpectrumAnalyzerApp(QObject):
             
             if not result.get('success', False):
                 self.logger.debug(f"Processing chain failed: {result.get('error', 'Unknown error')}")
-                # Fallback to demo data for development
-                result = self._generate_demo_analysis_result()
+                # Only fallback to synthetic result in demo mode.
+                if self.demo_mode:
+                    result = self._generate_demo_analysis_result()
+                else:
+                    return
             
             self.logger.debug(f"Processing chain result keys: {list(result.keys())}")
             self.logger.debug(f"Processing success: {result.get('success', False)}")
@@ -596,10 +613,16 @@ class RFSpectrumAnalyzerApp(QObject):
             if hasattr(self.main_window, 'bitstream_widget') and self.main_window.bitstream_widget:
                 bitstream_widget = self.main_window.bitstream_widget
                 if hasattr(bitstream_widget, 'add_bits') and len(self.bitstream_data) > 0:
-                    # Send new bits (limit to avoid flooding)
-                    new_bits = self.bitstream_data[-100:] if len(self.bitstream_data) > 100 else self.bitstream_data
-                    bitstream_widget.add_bits(new_bits)
-                    self.logger.debug(f"Updated bitstream with {len(new_bits)} bits")
+                    # Send only incremental bits to avoid duplicate re-appends on timer updates.
+                    start_idx = min(self._bitstream_gui_sent_count, len(self.bitstream_data))
+                    if start_idx < len(self.bitstream_data):
+                        new_bits = self.bitstream_data[start_idx:]
+                        if len(new_bits) > 100:
+                            new_bits = new_bits[-100:]
+                            start_idx = len(self.bitstream_data) - len(new_bits)
+                        bitstream_widget.add_bits(new_bits)
+                        self._bitstream_gui_sent_count = start_idx + len(new_bits)
+                        self.logger.debug(f"Updated bitstream with {len(new_bits)} new bits")
                     
         except Exception as e:
             self.logger.debug(f"Error updating GUI widgets: {e}")
@@ -1010,11 +1033,17 @@ class RFSpectrumAnalyzerApp(QObject):
                     analysis_request['center_freq'],
                     analysis_request['bandwidth']
                 )
+                payload = analysis_results.get('payload', analysis_results)
+                if not analysis_results.get('success', True):
+                    self.logger.warning(
+                        f"Signal analysis failed: {analysis_results.get('error', 'Unknown error')}"
+                    )
+                    return
                 
                 # Update GUI with analysis results
-                self._update_gui_with_analysis_results(analysis_results)
+                self._update_gui_with_analysis_results(payload)
                 
-                self.logger.info(f"Signal analysis completed: {analysis_results.get('modulation', {}).get('type', 'Unknown')} detected")
+                self.logger.info(f"Signal analysis completed: {payload.get('modulation', {}).get('type', 'Unknown')} detected")
             else:
                 self.logger.error("Signal analyzer not initialized")
                 
@@ -1149,15 +1178,23 @@ class RFSpectrumAnalyzerApp(QObject):
         try:
             if not self.main_window:
                 return
+
+            # Support both envelope format and legacy flat dictionaries.
+            results = analysis_results.get('payload', analysis_results)
+            if not isinstance(results, dict):
+                return
+            if not analysis_results.get('success', True):
+                self.logger.warning(f"Signal analysis reported error: {analysis_results.get('error', 'Unknown error')}")
+                return
             
             # Update constellation widget
-            if 'constellation_data' in analysis_results and analysis_results['constellation_data']['points']:
-                constellation_points = np.array(analysis_results['constellation_data']['points'])
+            if 'constellation_data' in results and results['constellation_data']['points']:
+                constellation_points = np.array(results['constellation_data']['points'])
                 if len(constellation_points) > 0:
                     # Extract modulation info for the widget
                     modulation_info = {
-                        'type': analysis_results['modulation']['type'],
-                        'confidence': analysis_results['modulation']['confidence']
+                        'type': results['modulation']['type'],
+                        'confidence': results['modulation']['confidence']
                     }
                     self.main_window.constellation_widget.update_constellation(
                         constellation_points,
@@ -1166,9 +1203,9 @@ class RFSpectrumAnalyzerApp(QObject):
                     )
             
             # Update bitstream widget
-            if analysis_results['demodulation']['success'] and 'coding' in analysis_results and analysis_results['coding']:
-                if analysis_results['coding']['decoded_bits'] is not None:
-                    decoded_bits = np.array(analysis_results['coding']['decoded_bits'])
+            if results.get('demodulation', {}).get('success') and results.get('coding'):
+                if results['coding']['decoded_bits'] is not None:
+                    decoded_bits = np.array(results['coding']['decoded_bits'])
                     # Convert to list of integers for the widget
                     if decoded_bits.dtype == bool:
                         bits = decoded_bits.astype(int).tolist()
@@ -1177,14 +1214,14 @@ class RFSpectrumAnalyzerApp(QObject):
                     self.main_window.bitstream_widget.add_bits(bits)
             
             # Update info display
-            info_text = f"Modulation: {analysis_results['modulation']['type']} " \
-                       f"(Confidence: {analysis_results['modulation']['confidence']:.2f})"
+            info_text = f"Modulation: {results['modulation']['type']} " \
+                       f"(Confidence: {results['modulation']['confidence']:.2f})"
             
-            if analysis_results['demodulation']['snr'] is not None:
-                info_text += f", SNR: {analysis_results['demodulation']['snr']:.1f} dB"
+            if results['demodulation']['snr'] is not None:
+                info_text += f", SNR: {results['demodulation']['snr']:.1f} dB"
             
-            if 'coding' in analysis_results and analysis_results['coding']:
-                info_text += f", Coding: {analysis_results['coding']['coding_type']}"
+            if 'coding' in results and results['coding']:
+                info_text += f", Coding: {results['coding']['coding_type']}"
             
             # Display in spectrum widget info label
             self.main_window.spectrum_widget.info_label.setText(info_text)

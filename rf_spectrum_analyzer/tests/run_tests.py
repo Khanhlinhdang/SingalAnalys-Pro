@@ -23,9 +23,9 @@ from pathlib import Path
 import warnings
 from io import StringIO
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# Add workspace root to path so rf_spectrum_analyzer package imports resolve correctly
+workspace_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(workspace_root))
 
 # Test coverage support
 try:
@@ -44,6 +44,7 @@ except ImportError:
 # Test modules
 TEST_MODULES = {
     'imports': 'test_imports',
+    'contract_schema': 'test_contract_schema',
     'dsp_filters': 'test_dsp_filters',
     'dsp_modulation': 'test_dsp_modulation',
     'dsp_analysis': 'test_dsp_analysis',
@@ -52,13 +53,15 @@ TEST_MODULES = {
     'backends': 'test_backends',
     'gui': 'test_gui',
     'integration': 'test_integration',
+    'pipeline_e2e': 'test_pipeline_e2e',
+    'app_layer_integration': 'test_app_layer_integration',
     'debug_performance': 'test_debug_performance'
 }
 
 # Test categories
 TEST_CATEGORIES = {
-    'fast': ['imports', 'dsp_filters', 'dsp_modulation', 'dsp_analysis', 'dsp_utils'],
-    'medium': ['core', 'backends', 'gui'],
+    'fast': ['imports', 'contract_schema', 'dsp_filters', 'dsp_modulation', 'dsp_analysis', 'dsp_utils'],
+    'medium': ['core', 'backends', 'gui', 'pipeline_e2e', 'app_layer_integration'],
     'slow': ['integration', 'debug_performance'],
     'all': list(TEST_MODULES.keys())
 }
@@ -213,8 +216,11 @@ class TestRunner:
         print(f"{'-'*60}")
         
         try:
-            # Import test module
-            test_module = __import__(f'tests.{module_file}', fromlist=['tests'])
+            # Import test module from package-qualified path
+            test_module = __import__(
+                f'rf_spectrum_analyzer.tests.{module_file}',
+                fromlist=['rf_spectrum_analyzer.tests']
+            )
             
             # Create test suite
             loader = unittest.TestLoader()

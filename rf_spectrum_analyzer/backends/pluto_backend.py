@@ -8,6 +8,7 @@ import logging
 from typing import Optional, Dict, Any, List
 from rf_spectrum_analyzer.core.sdr_backend import SDRBackend
 from rf_spectrum_analyzer.config.settings import Settings
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +282,13 @@ class PlutoSDRBackend(SDRBackend):
     def get_device_info(self) -> Dict[str, Any]:
         """Get comprehensive PlutoSDR device information."""
         if not self.sdr:
-            return {"device_type": "PlutoSDR", "status": "disconnected"}
+            info = {"device_type": "PlutoSDR", "status": "disconnected"}
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'PlutoSDRBackend.get_device_info', 'backend': 'plutosdr', 'connected': False},
+                **info,
+            )
         
         try:
             info = {
@@ -307,11 +314,23 @@ class PlutoSDRBackend(SDRBackend):
             except Exception:
                 pass
             
-            return info
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'PlutoSDRBackend.get_device_info', 'backend': 'plutosdr', 'connected': True},
+                **info,
+            )
             
         except Exception as e:
             logger.error(f"Error getting PlutoSDR device info: {e}")
-            return {"device_type": "PlutoSDR", "status": "error", "error": str(e)}
+            info = {"device_type": "PlutoSDR", "status": "error"}
+            return make_api_result(
+                success=False,
+                error=str(e),
+                payload=info,
+                meta={'api': 'PlutoSDRBackend.get_device_info', 'backend': 'plutosdr', 'connected': False},
+                **info,
+            )
     
     def get_frequency_range(self) -> tuple:
         """Get supported frequency range for PlutoSDR."""

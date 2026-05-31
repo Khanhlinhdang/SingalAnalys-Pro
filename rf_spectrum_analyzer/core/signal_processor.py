@@ -43,6 +43,7 @@ from rf_spectrum_analyzer.dsp.decoding_engine import create_decoding_engine
 from rf_spectrum_analyzer.dsp.signal_detection import create_signal_detector
 from rf_spectrum_analyzer.dsp.tdma_detector import TDMABurstDetector
 from rf_spectrum_analyzer.dsp.enhanced_analysis import EnhancedSignalAnalysis
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,30 @@ class SignalProcessor:
         self._performance_mode = 'balanced'  # 'fast', 'balanced', 'quality'
         
         self.logger.info("Signal processor initialized")
+
+    def _result_ok(self, payload: Optional[Dict[str, Any]] = None,
+                   meta: Optional[Dict[str, Any]] = None,
+                   **legacy_fields) -> Dict[str, Any]:
+        """Return standardized success result with backward-compatible top-level fields."""
+        return make_api_result(
+            success=True,
+            payload=payload,
+            meta=meta,
+            **legacy_fields,
+        )
+
+    def _result_error(self, error: str,
+                      payload: Optional[Dict[str, Any]] = None,
+                      meta: Optional[Dict[str, Any]] = None,
+                      **legacy_fields) -> Dict[str, Any]:
+        """Return standardized error result with optional payload/meta."""
+        return make_api_result(
+            success=False,
+            error=error,
+            payload=payload,
+            meta=meta,
+            **legacy_fields,
+        )
     
     def _setup_fft(self):
         """Setup optimized FFT computation with pyFFTW and PySDR best practices."""
@@ -758,7 +783,8 @@ class SignalProcessor:
         """
         try:
             if len(iq_samples) < 1024:
-                return {"type": "Unknown", "confidence": 0.0, "parameters": {}}
+                payload = {"type": "Unknown", "confidence": 0.0, "parameters": {}}
+                return self._result_ok(payload=payload, meta={"reason": "insufficient_samples"})
             
             # Perform modulation analysis
             modulation_result = self.modulation_analyzer.detect_modulation(iq_samples)
@@ -769,167 +795,12 @@ class SignalProcessor:
             self.logger.debug(f"Detected modulation: {modulation_result['type']} "
                             f"(confidence: {modulation_result['confidence']:.2f})")
             
-            return modulation_result
+            return self._result_ok(payload=modulation_result)
             
         except Exception as e:
             self.logger.error(f"Modulation analysis error: {e}")
-            return {"type": "Unknown", "confidence": 0.0, "parameters": {}, "error": str(e)}
-    
-    def demodulate_signal(self, iq_samples: np.ndarray, 
-                         modulation_type: str = None, 
-                         parameters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Demodulate signal based on modulation type.
-        
-        Args:
-            iq_samples: Complex IQ signal data
-            modulation_type: Modulation type (auto-detect if None)
-            parameters: Modulation parameters
-            
-        Returns:
-            Dictionary containing demodulated data and metadata
-        """
-        try:
-            # Auto-detect modulation if not specified
-            if modulation_type is None:
-                if self.last_modulation_analysis is None:
-                    mod_analysis = self.analyze_modulation(iq_samples)
-                else:
-                    mod_analysis = self.last_modulation_analysis
-                
-                modulation_type = mod_analysis["type"]
-                if parameters is None:
-                    parameters = mod_analysis.get("parameters", {})
-            
-            # Demodulate using the appropriate engine
-            demod_result = self.demodulation_engine.demodulate(
-                iq_samples, modulation_type, parameters
-            )
-            
-            self.logger.debug(f"Demodulated {modulation_type} signal, "
-                            f"got {len(demod_result.get('demodulated_data', []))} samples")
-            
-            return demod_result
-            
-        except Exception as e:
-            self.logger.error(f"Demodulation error: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def analyze_encoding(self, bit_data: np.ndarray) -> Dict[str, Any]:
-        """
-        Analyze channel coding from bit sequence.
-        
-        Args:
-            bit_data: Binary data sequence
-            
-        Returns:
-            Dictionary containing encoding analysis results
-        """
-        try:
-            if len(bit_data) < 64:
-                return {"type": "None", "confidence": 0.0, "parameters": {}}
-            
-            # Perform encoding analysis
-            encoding_result = self.encoding_analyzer.detect_encoding(bit_data)
-            
-            # Cache the result
-            self.last_encoding_analysis = encoding_result
-            
-            self.logger.debug(f"Detected encoding: {encoding_result['type']} "
-                            f"(confidence: {encoding_result['confidence']:.2f})")
-            
-            return encoding_result
-            
-        except Exception as e:
-            self.logger.error(f"Encoding analysis error: {e}")
-            return {"type": "None", "confidence": 0.0, "parameters": {}, "error": str(e)}
-    
-    def decode_data(self, encoded_data: np.ndarray, 
-                   coding_type: str = None, 
-                   parameters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Decode channel-coded data.
-        
-        Args:
-            encoded_data: Encoded bit sequence
-            coding_type: Coding type (auto-detect if None)
-            parameters: Coding parameters
-            
-        Returns:
-            Dictionary containing decoded data and metadata
-        """
-        try:
-            # Auto-detect encoding if not specified
-            if coding_type is None:
-                if self.last_encoding_analysis is None:
-                    enc_analysis = self.analyze_encoding(encoded_data)
-                else:
-                    enc_analysis = self.last_encoding_analysis
-                
-                coding_type = enc_analysis["type"]
-                if parameters is None:
-                    parameters = enc_analysis.get("parameters", {})
-            
-            # Decode using the appropriate engine
-            decode_result = self.decoding_engine.decode(
-                encoded_data, coding_type, parameters
-            )
-            
-            self.logger.debug(f"Decoded {coding_type} data, "
-                            f"corrected {decode_result.get('corrected_errors', 0)} errors")
-            
-            return decode_result
-            
-        except Exception as e:
-            self.logger.error(f"Decoding error: {e}")
-            return {"success": False, "error": str(e)}
-    
-    # Configuration methods
-    def set_fft_size(self, fft_size: int):
-        """Update FFT size."""
-        self.fft_size = fft_size
-        self.window = self._create_window(self.window_type, self.fft_size)
-        self._setup_fft()
-        self.spectrum_history.clear()
-    
-    def set_window_function(self, window_type: str):
-        """Update window function."""
-        self.window_type = window_type
-        self.window = self._create_window(window_type, self.fft_size)
-    
-    def set_averaging(self, averaging: int):
-        """Update averaging count."""
-        self.averaging = averaging
-    
-    # Modulation Analysis and Demodulation Methods
-    def analyze_modulation(self, iq_samples: np.ndarray) -> Dict[str, Any]:
-        """
-        Analyze modulation type and parameters from IQ samples.
-        
-        Args:
-            iq_samples: Complex IQ signal data
-            
-        Returns:
-            Dictionary containing modulation analysis results
-        """
-        try:
-            if len(iq_samples) < 1024:
-                return {"type": "Unknown", "confidence": 0.0, "parameters": {}}
-            
-            # Perform modulation analysis
-            modulation_result = self.modulation_analyzer.detect_modulation(iq_samples)
-            
-            # Cache the result
-            self.last_modulation_analysis = modulation_result
-            
-            self.logger.debug(f"Detected modulation: {modulation_result['type']} "
-                            f"(confidence: {modulation_result['confidence']:.2f})")
-            
-            return modulation_result
-            
-        except Exception as e:
-            self.logger.error(f"Modulation analysis error: {e}")
-            return {"type": "Unknown", "confidence": 0.0, "parameters": {}, "error": str(e)}
+            payload = {"type": "Unknown", "confidence": 0.0, "parameters": {}}
+            return self._result_error(str(e), payload=payload)
     
     def demodulate_signal(self, iq_samples: np.ndarray, 
                          modulation_type: str = None, 
@@ -974,11 +845,11 @@ class SignalProcessor:
             self.logger.debug(f"Demodulated {modulation_type} signal, "
                             f"got {len(demod_result.get('demodulated_data', []))} samples")
             
-            return demod_result
+            return self._result_ok(payload=demod_result, meta={"modulation_type": modulation_type})
             
         except Exception as e:
             self.logger.error(f"Demodulation error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e), meta={"modulation_type": modulation_type})
     
     def analyze_encoding(self, bit_data: np.ndarray) -> Dict[str, Any]:
         """
@@ -992,7 +863,8 @@ class SignalProcessor:
         """
         try:
             if len(bit_data) < 64:
-                return {"type": "None", "confidence": 0.0, "parameters": {}}
+                payload = {"type": "None", "confidence": 0.0, "parameters": {}}
+                return self._result_ok(payload=payload, meta={"reason": "insufficient_bits"})
             
             # Perform encoding analysis
             encoding_result = self.encoding_analyzer.detect_encoding(bit_data)
@@ -1003,11 +875,12 @@ class SignalProcessor:
             self.logger.debug(f"Detected encoding: {encoding_result['type']} "
                             f"(confidence: {encoding_result['confidence']:.2f})")
             
-            return encoding_result
+            return self._result_ok(payload=encoding_result)
             
         except Exception as e:
             self.logger.error(f"Encoding analysis error: {e}")
-            return {"type": "None", "confidence": 0.0, "parameters": {}, "error": str(e)}
+            payload = {"type": "None", "confidence": 0.0, "parameters": {}}
+            return self._result_error(str(e), payload=payload)
     
     def decode_data(self, encoded_data: np.ndarray, 
                    coding_type: str = None, 
@@ -1043,11 +916,11 @@ class SignalProcessor:
             self.logger.debug(f"Decoded {coding_type} data, "
                             f"corrected {decode_result.get('corrected_errors', 0)} errors")
             
-            return decode_result
+            return self._result_ok(payload=decode_result, meta={"coding_type": coding_type})
             
         except Exception as e:
             self.logger.error(f"Decoding error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e), meta={"coding_type": coding_type})
     
     def process_complete_chain(self, iq_samples: np.ndarray) -> Dict[str, Any]:
         """
@@ -1061,7 +934,6 @@ class SignalProcessor:
         """
         try:
             result = {
-                "success": False,
                 "modulation_analysis": {},
                 "demodulation": {},
                 "encoding_analysis": {},
@@ -1070,7 +942,7 @@ class SignalProcessor:
             }
             
             if len(iq_samples) == 0:
-                return result
+                return self._result_error("Empty signal", payload=result)
             
             # Step 1: Modulation Analysis
             self.logger.debug("Step 1: Analyzing modulation...")
@@ -1138,21 +1010,21 @@ class SignalProcessor:
                 # Unknown modulation - pass through raw IQ
                 result["final_data"] = iq_samples
             
-            result["success"] = True
             self.logger.debug("Complete processing chain completed successfully")
-            return result
+            return self._result_ok(payload=result)
             
         except Exception as e:
             self.logger.error(f"Complete processing chain error: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "modulation_analysis": {},
-                "demodulation": {},
-                "encoding_analysis": {},
-                "decoding": {},
-                "final_data": np.array([])
-            }
+            return self._result_error(
+                str(e),
+                payload={
+                    "modulation_analysis": {},
+                    "demodulation": {},
+                    "encoding_analysis": {},
+                    "decoding": {},
+                    "final_data": np.array([])
+                }
+            )
 
     def update_sample_rate(self, sample_rate: float):
         """Update sample rate for modulation analysis engines."""
@@ -1183,7 +1055,7 @@ class SignalProcessor:
             from rf_spectrum_analyzer.dsp.signal_detection import DetectionMethod
             
             if len(iq_samples) == 0:
-                return {"success": False, "error": "Empty signal"}
+                return self._result_error("Empty signal")
             
             # Choose detection method
             if method == "energy":
@@ -1207,7 +1079,6 @@ class SignalProcessor:
             
             # Convert to dictionary for easier handling
             detection_dict = {
-                "success": True,
                 "signal_detected": result.signal_detected,
                 "detection_method": result.detection_method,
                 "confidence": result.confidence,
@@ -1222,14 +1093,14 @@ class SignalProcessor:
             self.logger.debug(f"Signal detection: {result.signal_detected} "
                             f"(confidence: {result.confidence:.3f}, SNR: {result.snr_estimate:.1f} dB)")
             
-            return detection_dict
+            return self._result_ok(payload=detection_dict)
             
         except Exception as e:
             self.logger.error(f"Signal detection error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
-    def detect_tdma_bursts(self, iq_samples: np.ndarray, 
-                          sync_pattern: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    def _detect_tdma_bursts_detailed(self, iq_samples: np.ndarray,
+                                     sync_pattern: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
         Detect TDMA bursts in signal.
         
@@ -1242,7 +1113,7 @@ class SignalProcessor:
         """
         try:
             if len(iq_samples) == 0:
-                return {"success": False, "error": "Empty signal"}
+                return self._result_error("Empty signal")
             
             # Set sync pattern if provided
             if sync_pattern is not None:
@@ -1263,7 +1134,6 @@ class SignalProcessor:
             }
             
             result = {
-                "success": True,
                 "burst_count": len(bursts),
                 "bursts_detected": len(bursts) > 0,
                 "bursts": bursts,
@@ -1272,11 +1142,11 @@ class SignalProcessor:
             
             self.logger.debug(f"TDMA detection: {len(bursts)} bursts found")
             
-            return result
+            return self._result_ok(payload=result)
             
         except Exception as e:
             self.logger.error(f"TDMA burst detection error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def spectrum_sensing(self, iq_samples: np.ndarray, 
                         frequency_bands: Dict[str, Tuple[float, float]]) -> Dict[str, Any]:
@@ -1292,7 +1162,7 @@ class SignalProcessor:
         """
         try:
             if len(iq_samples) == 0:
-                return {"success": False, "error": "Empty signal"}
+                return self._result_error("Empty signal")
             
             # Perform spectrum sensing
             sensing_results = self.signal_detector.spectrum_sensing(iq_samples, frequency_bands)
@@ -1312,16 +1182,15 @@ class SignalProcessor:
                     "detection_confidence": result.detection_confidence
                 }
             
-            return {
-                "success": True,
+            return self._result_ok(payload={
                 "band_results": results_dict,
                 "total_bands": len(frequency_bands),
                 "occupied_bands": sum(1 for r in sensing_results.values() if r.signal_detected)
-            }
+            })
             
         except Exception as e:
             self.logger.error(f"Spectrum sensing error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def calibrate_detector(self, noise_samples: np.ndarray, method: str = "robust") -> Dict[str, Any]:
         """
@@ -1336,20 +1205,19 @@ class SignalProcessor:
         """
         try:
             if len(noise_samples) == 0:
-                return {"success": False, "error": "Empty noise samples"}
+                return self._result_error("Empty noise samples")
             
             noise_variance = self.signal_detector.calibrate_noise_floor(noise_samples, method)
             
-            return {
-                "success": True,
+            return self._result_ok(payload={
                 "noise_variance": noise_variance,
                 "method": method,
                 "calibrated": self.signal_detector.calibrated
-            }
+            })
             
         except Exception as e:
             self.logger.error(f"Detector calibration error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def add_signal_template(self, name: str, template: np.ndarray):
         """
@@ -1420,32 +1288,25 @@ class SignalProcessor:
             if iq_samples is None:
                 if not hasattr(self, '_current_iq_data') or self._current_iq_data is None:
                     self.logger.warning("No signal data available for TDMA detection")
-                    return None
+                    return self._result_error("No signal data available for TDMA detection")
                 iq_samples = self._current_iq_data
-            
-            # Perform TDMA burst detection using the tdma_detector
-            result = self.tdma_detector.detect_bursts(iq_samples)
-            
-            if result:
-                # Analyze timing if bursts found
-                timing_analysis = None
-                if result:
-                    timing_analysis = self.tdma_detector.analyze_timing(result)
-                
-                return {
-                    "detected": len(result) > 0,
-                    "burst_count": len(result),
-                    "bursts": result,
-                    "timing_analysis": timing_analysis,
-                    "method": "tdma_burst",
-                    "timestamp": "manual_trigger"
-                }
-            else:
-                return None
+
+            detailed = self._detect_tdma_bursts_detailed(iq_samples)
+            if not detailed.get("success", False):
+                return detailed
+
+            return self._result_ok(payload={
+                "detected": detailed.get("bursts_detected", False),
+                "burst_count": detailed.get("burst_count", 0),
+                "bursts": detailed.get("bursts", []),
+                "timing_analysis": detailed.get("timing_analysis"),
+                "method": "tdma_burst",
+                "timestamp": "manual_trigger"
+            })
                 
         except Exception as e:
             self.logger.error(f"TDMA detection error: {e}")
-            return None
+            return self._result_error(str(e))
     
     def set_auto_detection(self, enabled: bool):
         """
@@ -1569,7 +1430,7 @@ class SignalProcessor:
         """
         try:
             if len(iq_samples) == 0:
-                return {"success": False, "error": "Empty signal"}
+                return self._result_error("Empty signal")
             
             # Perform enhanced analysis
             result = self.enhanced_analyzer.analyze_iq_data(iq_samples)
@@ -1579,7 +1440,6 @@ class SignalProcessor:
             
             # Convert to dictionary for easier handling
             analysis_dict = {
-                "success": True,
                 "analysis_method": result.analysis_method,
                 "sdrconnect_available": result.sdrconnect_available,
                 
@@ -1622,15 +1482,15 @@ class SignalProcessor:
             
             self.logger.debug(f"Enhanced analysis completed using {result.analysis_method} method")
             
-            return analysis_dict
+            return self._result_ok(payload=analysis_dict)
             
         except Exception as e:
             self.logger.error(f"Enhanced analysis error: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def get_analysis_capabilities(self) -> Dict[str, Any]:
         """Get information about analysis capabilities."""
-        return {
+        return self._result_ok(payload={
             "sdr_available": SDR_AVAILABLE,
             "scikit_dsp_available": SCIKIT_DSP_AVAILABLE,
             "pyfftw_available": PYFFTW_AVAILABLE,
@@ -1639,7 +1499,7 @@ class SignalProcessor:
             "window_type": self.window_type,
             "fft_size": self.fft_size,
             "averaging": self.averaging
-        }
+        })
     
     # Sequential Workflow Methods
     def set_analysis_frequency_range(self, f1: float, f2: float):
@@ -1665,24 +1525,24 @@ class SignalProcessor:
         try:
             if not hasattr(self, 'analysis_f1') or not hasattr(self, 'analysis_f2'):
                 self.logger.warning("No frequency range set for analysis")
-                return {"success": False, "error": "No frequency range set"}
+                return self._result_error("No frequency range set")
             
             # Get current IQ data buffer
             if not hasattr(self, '_current_iq_data') or self._current_iq_data is None or len(self._current_iq_data) == 0:
                 self.logger.warning("No IQ data available for analysis")
-                return {"success": False, "error": "No IQ data available"}
+                return self._result_error("No IQ data available")
             
             # Filter signal to analysis bandwidth
             filtered_iq = self._filter_to_frequency_range(self._current_iq_data)
             
             if len(filtered_iq) == 0:
-                return {"success": False, "error": "No signal in frequency range"}
+                return self._result_error("No signal in frequency range")
             
             # Detect modulation type
             modulation_result = self._detect_modulation_type(filtered_iq)
             
             if not modulation_result or not modulation_result.get('success', False):
-                return {"success": False, "error": "Modulation detection failed"}
+                return self._result_error("Modulation detection failed")
             
             modulation_type = modulation_result.get('modulation_type', 'unknown')
             
@@ -1698,30 +1558,29 @@ class SignalProcessor:
                     'demodulation_params': demod_result.get('parameters', {})
                 }
                 
-                return {
-                    "success": True,
+                return self._result_ok(payload={
                     "modulation_type": modulation_type,
                     "demodulated_data": self.demodulated_data,
                     "metadata": self.demodulated_metadata
-                }
+                })
             else:
-                return {"success": False, "error": "Demodulation failed"}
+                return self._result_error("Demodulation failed")
                 
         except Exception as e:
             self.logger.error(f"Error in detect_and_demodulate: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def detect_and_decode(self) -> Optional[Dict[str, Any]]:
         """Detect coding type and decode demodulated signal."""
         try:
             if not self.has_demodulated_data():
-                return {"success": False, "error": "No demodulated data available"}
+                return self._result_error("No demodulated data available")
             
             # Detect channel coding type
             coding_result = self._detect_coding_type(self.demodulated_data)
             
             if not coding_result or not coding_result.get('success', False):
-                return {"success": False, "error": "Coding detection failed"}
+                return self._result_error("Coding detection failed")
             
             coding_type = coding_result.get('coding_type', 'unknown')
             
@@ -1731,21 +1590,20 @@ class SignalProcessor:
             if decode_result and decode_result.get('success', False):
                 decoded_data = decode_result.get('decoded_data', np.array([]))
                 
-                return {
-                    "success": True,
+                return self._result_ok(payload={
                     "coding_type": coding_type,
                     "decoded_data": decoded_data,
                     "metadata": {
                         'original_modulation': getattr(self, 'demodulated_metadata', {}).get('modulation_type', 'unknown'),
                         'coding_params': decode_result.get('parameters', {})
                     }
-                }
+                })
             else:
-                return {"success": False, "error": "Decoding failed"}
+                return self._result_error("Decoding failed")
                 
         except Exception as e:
             self.logger.error(f"Error in detect_and_decode: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def has_demodulated_data(self) -> bool:
         """Check if demodulated data is available."""
@@ -1809,19 +1667,18 @@ class SignalProcessor:
             else:
                 modulation_type = "PSK"
             
-            return {
-                "success": True,
+            return self._result_ok(payload={
                 "modulation_type": modulation_type,
                 "confidence": 0.7,  # Basic detection has lower confidence
                 "parameters": {
                     "magnitude_variation": magnitude_variation,
                     "phase_std": phase_std
                 }
-            }
+            })
             
         except Exception as e:
             self.logger.error(f"Error detecting modulation type: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def _detect_coding_type(self, demod_data: np.ndarray) -> Optional[Dict[str, Any]]:
         """Detect channel coding type from demodulated data."""
@@ -1844,19 +1701,18 @@ class SignalProcessor:
             else:
                 coding_type = "none"
             
-            return {
-                "success": True,
+            return self._result_ok(payload={
                 "coding_type": coding_type,
                 "confidence": 0.6,  # Basic detection has lower confidence
                 "parameters": {
                     "data_length": data_len,
                     "estimated_rate": "1/2" if coding_type.startswith("convolutional") else "variable"
                 }
-            }
+            })
             
         except Exception as e:
             self.logger.error(f"Error detecting coding type: {e}")
-            return {"success": False, "error": str(e)}
+            return self._result_error(str(e))
     
     def set_performance_mode(self, mode: str):
         """Set performance mode for spectrum computation.

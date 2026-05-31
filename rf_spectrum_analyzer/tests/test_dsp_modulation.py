@@ -9,9 +9,9 @@ from pathlib import Path
 import sys
 import warnings
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# Add workspace root to path
+workspace_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(workspace_root))
 
 # Suppress warnings for cleaner test output
 warnings.filterwarnings('ignore')

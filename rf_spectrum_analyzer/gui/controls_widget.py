@@ -739,43 +739,61 @@ class ControlsWidget(QWidget):
     
     def load_settings(self):
         """Load settings into controls."""
+        def _as_str(value, default=""):
+            try:
+                return value if isinstance(value, str) else str(value)
+            except Exception:
+                return default
+
+        def _as_float(value, default=0.0):
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        def _as_int(value, default=0):
+            try:
+                return int(value)
+            except Exception:
+                return int(default)
+
         # Device settings
-        self.device_combo.setCurrentText(self.settings.sdr.device_type)
-        self.frequency_input.setText(f"{self.settings.sdr.center_frequency/1e6:.3f}")
-        self.gain_spinbox.setValue(self.settings.sdr.gain)
+        self.device_combo.setCurrentText(_as_str(self.settings.sdr.device_type, "spyserver"))
+        self.frequency_input.setText(f"{_as_float(self.settings.sdr.center_frequency, 100e6)/1e6:.3f}")
+        self.gain_spinbox.setValue(_as_float(self.settings.sdr.gain, 0.0))
         
         # Sample rate
-        sample_rate_mhz = self.settings.sdr.sample_rate / 1e6
+        sample_rate_mhz = _as_float(self.settings.sdr.sample_rate, 1e6) / 1e6
         for i in range(self.sample_rate_combo.count()):
             if f"{sample_rate_mhz:.1f}" in self.sample_rate_combo.itemText(i):
                 self.sample_rate_combo.setCurrentIndex(i)
                 break
         
         # Bandwidth
-        bandwidth_mhz = self.settings.sdr.bandwidth / 1e6
+        bandwidth_mhz = _as_float(self.settings.sdr.bandwidth, 1e6) / 1e6
         for i in range(self.bandwidth_combo.count()):
             if f"{bandwidth_mhz:.1f}" in self.bandwidth_combo.itemText(i):
                 self.bandwidth_combo.setCurrentIndex(i)
                 break
         
         # Processing settings
-        self.fft_size_combo.setCurrentText(str(self.settings.dsp.fft_size))
-        self.window_combo.setCurrentText(self.settings.dsp.window_type)
-        self.overlap_spinbox.setValue(self.settings.dsp.overlap * 100)
-        self.averaging_spinbox.setValue(self.settings.dsp.averaging)
+        self.fft_size_combo.setCurrentText(str(_as_int(self.settings.dsp.fft_size, 1024)))
+        self.window_combo.setCurrentText(_as_str(self.settings.dsp.window_type, "hann"))
+        self.overlap_spinbox.setValue(_as_float(self.settings.dsp.overlap, 0.5) * 100)
+        self.averaging_spinbox.setValue(_as_int(self.settings.dsp.averaging, 1))
         
         # Filter settings
-        self.filter_type_combo.setCurrentText(self.settings.dsp.filter_type)
-        self.filter_low_spinbox.setValue(self.settings.dsp.filter_cutoff_low)
-        self.filter_high_spinbox.setValue(self.settings.dsp.filter_cutoff_high)
+        self.filter_type_combo.setCurrentText(_as_str(self.settings.dsp.filter_type, "none"))
+        self.filter_low_spinbox.setValue(_as_float(self.settings.dsp.filter_cutoff_low, 0.0))
+        self.filter_high_spinbox.setValue(_as_float(self.settings.dsp.filter_cutoff_high, 0.0))
         
         # Display settings
-        self.y_min_spinbox.setValue(self.settings.gui.spectrum_min_db)
-        self.y_max_spinbox.setValue(self.settings.gui.spectrum_max_db)
-        self.ref_level_spinbox.setValue(self.settings.gui.spectrum_ref_level)
-        self.spectrum_rate_spinbox.setValue(self.settings.gui.spectrum_update_rate)
-        self.waterfall_rate_spinbox.setValue(self.settings.gui.waterfall_update_rate)
-        self.theme_combo.setCurrentText(self.settings.gui.theme)
+        self.y_min_spinbox.setValue(_as_float(self.settings.gui.spectrum_min_db, -120.0))
+        self.y_max_spinbox.setValue(_as_float(self.settings.gui.spectrum_max_db, 0.0))
+        self.ref_level_spinbox.setValue(_as_float(self.settings.gui.spectrum_ref_level, 0.0))
+        self.spectrum_rate_spinbox.setValue(_as_int(self.settings.gui.spectrum_update_rate, 20))
+        self.waterfall_rate_spinbox.setValue(_as_int(self.settings.gui.waterfall_update_rate, 20))
+        self.theme_combo.setCurrentText(_as_str(self.settings.gui.theme, "dark"))
         
         # Initialize status indicators
         self.update_status("Ready")
@@ -789,23 +807,23 @@ class ControlsWidget(QWidget):
             # self.realtime_spectrum.setChecked(True)  # Widget removed in sequential workflow
             # self.peak_hold_enabled.setChecked(False)  # Widget removed in sequential workflow
             self._update_frequency_range_controls()
-        self.update_device_status(self.settings.sdr.device_type, False)
-        self.update_frequency_display(self.settings.sdr.center_frequency)
+        self.update_device_status(_as_str(self.settings.sdr.device_type, "spyserver"), False)
+        self.update_frequency_display(_as_float(self.settings.sdr.center_frequency, 100e6))
         
         # Load SpyServer settings
-        self.spyserver_host_input.setText(self.settings.sdr.spyserver_host)
-        self.spyserver_port_input.setValue(self.settings.sdr.spyserver_port)
-        self.spyserver_timeout_spinbox.setValue(self.settings.sdr.spyserver_timeout)
+        self.spyserver_host_input.setText(_as_str(self.settings.sdr.spyserver_host, "64.31.248.40"))
+        self.spyserver_port_input.setValue(_as_int(self.settings.sdr.spyserver_port, 63863))
+        self.spyserver_timeout_spinbox.setValue(_as_float(self.settings.sdr.spyserver_timeout, 10.0))
         
         # Update device type visibility  
         # Force trigger to ensure SpyServer controls are shown correctly
-        self._on_device_type_changed(self.settings.sdr.device_type)
+        self._on_device_type_changed(_as_str(self.settings.sdr.device_type, "spyserver"))
         
         # Load detection settings if available
         if hasattr(self.settings, 'detection'):
             self.auto_detection_checkbox.setChecked(self.settings.detection.auto_detection_enabled)
-            self.energy_threshold_spinbox.setValue(self.settings.detection.energy_threshold_dbm)
-            self.detection_interval_spinbox.setValue(self.settings.detection.detection_interval_ms)
+            self.energy_threshold_spinbox.setValue(_as_float(self.settings.detection.energy_threshold_dbm, -80.0))
+            self.detection_interval_spinbox.setValue(_as_int(self.settings.detection.detection_interval_ms, 100))
         else:
             # Set default values
             self.auto_detection_checkbox.setChecked(False)

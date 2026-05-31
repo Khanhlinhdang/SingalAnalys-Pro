@@ -49,6 +49,12 @@ class SpectrumWidget(QWidget):
         
         self.setup_ui()
         self.setup_plot()
+
+    def _safe_float(self, value, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
     
     def setup_ui(self):
         """Setup the widget UI."""
@@ -95,7 +101,8 @@ class SpectrumWidget(QWidget):
         
         # Create plot widget
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setBackground('black' if self.settings.gui.theme == 'dark' else 'white')
+        theme = str(getattr(self.settings.gui, 'theme', 'dark')).lower()
+        self.plot_widget.setBackground('black' if theme == 'dark' else 'white')
         layout.addWidget(self.plot_widget)
         
         # Info label for displaying measurements
@@ -113,6 +120,8 @@ class SpectrumWidget(QWidget):
         
         # Set axis ranges
         # Validate initial Y range values
+        self.min_db = self._safe_float(self.min_db, -120.0)
+        self.max_db = self._safe_float(self.max_db, 0.0)
         if not (np.isfinite(self.min_db) and np.isfinite(self.max_db) and self.min_db < self.max_db):
             print(f"Warning: Invalid initial Y range: min={self.min_db}, max={self.max_db}, using defaults")
             self.min_db = -120.0  # Default minimum
@@ -122,8 +131,10 @@ class SpectrumWidget(QWidget):
         plot.setYRange(float(self.min_db), float(self.max_db))
         
         # Enable grid
-        if self.settings.gui.grid_enabled:
-            plot.showGrid(x=True, y=True, alpha=self.settings.gui.grid_alpha)
+        if bool(getattr(self.settings.gui, 'grid_enabled', True)):
+            grid_alpha = self._safe_float(getattr(self.settings.gui, 'grid_alpha', 0.2), 0.2)
+            grid_alpha = max(0.0, min(1.0, grid_alpha))
+            plot.showGrid(x=True, y=True, alpha=grid_alpha)
         
         # Create spectrum curve
         self.spectrum_curve = plot.plot(

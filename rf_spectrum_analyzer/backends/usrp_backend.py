@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from rf_spectrum_analyzer.core.sdr_backend import SDRBackend, SDRDevice, StreamingError
 from rf_spectrum_analyzer.utils.logger import get_logger
+from rf_spectrum_analyzer.utils.schema import make_api_result
 
 # Import USRP interface from the main project directory
 import sys
@@ -236,13 +237,19 @@ class USRPBackend(SDRBackend):
     def get_device_info(self) -> Dict[str, Any]:
         """Get device information"""
         if not self.is_connected():
-            return {}
+            info = {'device_type': 'USRP', 'status': 'disconnected'}
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'USRPBackend.get_device_info', 'backend': 'usrp', 'connected': False},
+                **info,
+            )
         
         try:
             params = self.usrp.get_rx_parameters()
             stats = self.usrp.get_streaming_stats()
             
-            return {
+            info = {
                 'device_type': 'USRP',
                 'device_info': self.device_info,
                 'center_frequency': params.get('center_freq', self.center_frequency),
@@ -256,10 +263,23 @@ class USRPBackend(SDRBackend):
                 'underruns': stats.get('underruns', 0),
                 'queue_size': stats.get('queue_size', 0)
             }
+            return make_api_result(
+                success=True,
+                payload=info,
+                meta={'api': 'USRPBackend.get_device_info', 'backend': 'usrp', 'connected': True},
+                **info,
+            )
             
         except Exception as e:
             logger.error(f"Error getting device info: {e}")
-            return {'error': str(e)}
+            info = {'device_type': 'USRP', 'status': 'error'}
+            return make_api_result(
+                success=False,
+                error=str(e),
+                payload=info,
+                meta={'api': 'USRPBackend.get_device_info', 'backend': 'usrp', 'connected': False},
+                **info,
+            )
     
     def set_center_frequency(self, frequency: float) -> bool:
         """Set center frequency"""

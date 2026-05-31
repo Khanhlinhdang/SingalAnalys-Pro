@@ -32,13 +32,15 @@ def parse_arguments():
     parser.add_argument('--config', type=str, 
                        help='Path to configuration file')
     parser.add_argument('--device', type=str, 
-                       help='SDR device to use (hackrf, rtlsdr, pluto, soapy)')
+                       help='SDR device to use (hackrf, rtlsdr, pluto, soapy, spyserver)')
     parser.add_argument('--sample-rate', type=float, 
                        help='Sample rate in Hz')
     parser.add_argument('--frequency', type=float, 
                        help='Center frequency in Hz')
     parser.add_argument('--gain', type=float, 
                        help='RF gain in dB')
+    parser.add_argument('--demo', action='store_true',
+                       help='Run in demo mode with synthetic data')
     return parser.parse_args()
 
 
@@ -94,6 +96,9 @@ def main():
             settings.sdr.center_frequency = args.frequency
         if args.gain:
             settings.sdr.gain = args.gain
+        if args.demo:
+            settings.demo_mode = True
+            logger.info("Demo mode enabled via command line")
         
         # Setup Qt application
         qt_app = setup_application()

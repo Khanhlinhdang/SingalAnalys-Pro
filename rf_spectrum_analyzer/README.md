@@ -111,19 +111,18 @@ python main.py
 
 Or with specific options:
 ```bash
-python main.py --device rtlsdr --center-freq 100MHz --sample-rate 2.4MHz
+python main.py --device spyserver --frequency 100e6 --sample-rate 2.4e6 --demo
 ```
 
 ### Command Line Options
 
-- `--device`: SDR device type (rtlsdr, hackrf, pluto, soapy)
-- `--device-id`: Specific device identifier
-- `--center-freq`: Initial center frequency (Hz, kHz, MHz, GHz)
-- `--sample-rate`: Sample rate (Hz, kHz, MHz)
+- `--device`: SDR device type (rtlsdr, hackrf, pluto, soapy, spyserver)
+- `--frequency`: Initial center frequency in Hz
+- `--sample-rate`: Sample rate in Hz
 - `--gain`: Initial gain setting (dB)
 - `--config`: Load configuration file
-- `--theme`: UI theme (dark, light, auto)
-- `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR)
+- `--demo`: Run with synthetic IQ data when hardware is unavailable
+- `--debug`: Enable debug logging
 
 ### Basic Operation
 
@@ -155,8 +154,8 @@ python main.py --device rtlsdr --center-freq 100MHz --sample-rate 2.4MHz
 
 ### Settings File
 Application settings are automatically saved to:
-- Windows: `%USERPROFILE%\.rf_spectrum_analyzer\config.json`
-- Linux/macOS: `~/.rf_spectrum_analyzer/config.json`
+- Windows: `%USERPROFILE%\.rf_spectrum_analyzer\config.yaml`
+- Linux/macOS: `~/.rf_spectrum_analyzer/config.yaml`
 
 ### Customization
 - Modify themes in `resources/themes.py`
